@@ -83,9 +83,19 @@ sólo se emite cuando las dos superficies existen.
 **Lee**
 
 - Servidor: AST de Python. Routers estilo FastAPI (`@router.get/post/...` con ruta literal),
-  modelos Pydantic por herencia declarada (`BaseModel`), `Optional[...]`, valores por defecto
-  (`Field(...)` requerido, `Field(None)` opcional, `Field(min_length=1)` sin default), `alias=`
-  literal, `Body(..., embed=True)` con su alias, y anotaciones `list[...]` / `dict[...]`.
+  modelos Pydantic por herencia declarada (`BaseModel`) **y** `@dataclass` de pydantic,
+  `Optional[...]`, `X | None`, `Annotated[T, Body(embed=True)]`, valores por defecto
+  (`Field(...)` requerido, `Field(None)` opcional, `Field(min_length=1)` sin default, `field(...)`),
+  `alias=` literal, y anotaciones `list[...]` / `dict[...]` / `Literal[...]`.
+- Varios parámetros de cuerpo a la vez: FastAPI los **embebe** cada uno bajo su nombre o su
+  `alias`; el radar lee ese nombre, no una lista fundida de campos que el contrato nunca publica.
+- Formularios y ficheros (`Form()`, `File()`, `UploadFile`, `list[UploadFile]`): un escalar de
+  formulario **sí** publica una propiedad con su nombre; un modelo de formulario se publica
+  mediante `allOf`, y el radar fusiona `allOf` con las `properties` del mismo nivel.
+- `app.mount(...)` no publica las rutas del hijo en el esquema del padre (se excluyen);
+  `callbacks=router.routes` publica esas rutas bajo el árbol del llamante, no en `paths`;
+  `@app.webhooks.post(...)` vive en la sección `webhooks` y se compara en su propio espacio de
+  nombres; `include_in_schema=False` no se publica.
 - Los parámetros que son **dependencias** (`= Depends(...)`, `= Query(...)`, `= Header(...)`) no
   se leen como cuerpo: sin esa distinción, cada `Depends` con modelo anotado se publicaba como
   cuatro o cinco campos fantasma por operación.
@@ -105,6 +115,10 @@ sólo se emite cuando las dos superficies existen.
   no evalúa la condición, así que la ruta se publica con `CONDICIONAL_NO_PUBLICADA` y el número
   de inclusiones condicionales viaja en `inclusiones_condicionales`. No es deriva: es un estado
   del servidor que este instrumento no puede decidir.
+- El cuerpo que viaja en un formulario de seguridad (`OAuth2PasswordRequestForm` y su variante
+  `Strict`): sus seis campos (`grant_type`, `username`, `password`, `scope`, `client_id`,
+  `client_secret`) los genera `fastapi.security`, no el AST. Se publica
+  `CUERPO_NO_MEDIDO_POR_DEPENDENCIA` y ese cuerpo **no se compara** — declarado, no adivinado.
 - Frameworks cuyo enrutado no vive en un decorador con ruta literal.
 
 **Prefijos.** El prefijo estático de un router se compone (`APIRouter(prefix="/usuarios")` +
@@ -129,10 +143,11 @@ valor en vez de impedir la corrida.
 | `CODIGO_DIVERGENTE` | WARN | distinto código de éxito (`201` vs `200`); no fuerza RC 1 |
 | `CONDICIONAL_NO_PUBLICADA` | WARN | el servidor monta la ruta dentro de un `if`/`try` que el AST no evalúa; no fuerza RC 1 |
 | `ALIAS_NO_MEDIDO` | WARN | el modelo declara `alias_generator`: el nombre publicado no se calcula desde el AST; no fuerza RC 1 |
+| `CUERPO_NO_MEDIDO_POR_DEPENDENCIA` | WARN | el cuerpo viaja en un formulario de `fastapi.security`; sus campos no se calculan desde el AST y no se comparan |
 
 ## Estado medido
 
-- `v0.4.0` · 43 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.5.0` · 55 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
@@ -161,6 +176,29 @@ valor en vez de impedir la corrida.
   `Body(..., embed=True, alias="article")` sin embeker, `Field(...)` (pydantic v1) leído como
   opcional, `alias="tagList"` ignorado, `alias_generator` convertido en deriva y
   `status_code=HTTP_201_CREATED` (nombre suelto) leído como 200.
+- **Tercer oráculo, el corpus del propio framework**
+  ([`fastapi/fastapi`](https://github.com/fastapi/fastapi) @ `05e6df7`, 17-Nov-2026): los
+  **324 ejemplos ejecutables** de `docs_src`. Cada app se importa y su `app.openapi()` real es la
+  verdad, así que aquí no cabe la excusa de «otra forma de leer»: si el radar discrepa, el radar
+  está mal. Primera corrida: **40 apps con rojos**. Noventa y dos defectos de lector después (doce
+  causas distintas, todas con test): **0 apps con rojos**, **321 RC 0**, **3 RC 2** declarados
+  (`NO_MEDIDO`: apps sin una sola ruta publicada — sólo `StaticFiles`, sólo middleware, o la única
+  ruta con `include_in_schema=False`), **38 apps no construidas** por dependencias ausentes
+  (`httpx2`, `uvicorn`, `orjson`, directorio `static`), contadas y no escondidas.
+  Lo que este corpus encontró y los dos anteriores no podían ver: metadatos de `Annotated[...]`
+  ignorados (se perdían `Body(embed=True)` y `Depends`), `list[Model]` y `Model | None` sin
+  desenvolver, más de un cuerpo **sin embeber** bajo su nombre (dos modelos fundidos en una lista
+  que el contrato no publica), campo embebido tipado `object` en vez de su escalar real,
+  `required` mal calculado, envoltorio `anyOf` de pydantic v2 escondiendo el modelo a dos saltos,
+  convertidor `{p:path}`, `include_in_schema=False` publicado, `app.mount()` leído como router,
+  formularios y `multipart` fuera del lector de cuerpo, `@dataclass` desconocido como modelo,
+  `Literal["x"]` tipado como su texto, `allOf` sin fusionar con las `properties` del mismo nivel,
+  sección `webhooks`, routers de `callbacks=` y el formulario de `fastapi.security`.
+- **Una hipótesis propia que la medición mató** (misma corrida, 17-Nov-2026): durante un rato este
+  radar publicó que FastAPI «no publica los campos de un modelo de formulario». Falso: los publica
+  mediante `allOf` junto a los escalares del mismo nivel, y el que leía mal era este lector. Diez
+  apps daban rojo por ese defecto; corregido el lector, dan verde. Se anota aquí porque un
+  instrumento que presume un defecto del sujeto cuando el defecto es suyo no sirve de nada.
 - **Dos defectos del upstream**, medidos y no corregidos aquí: `backend/app/api/deps.py:36` no
   compila (`except InvalidTokenError, ValidationError:` es sintaxis de Python 2) y
   `backend/app/models.py:55` anota `list[Item]` antes de definir `Item` sin
@@ -195,6 +233,20 @@ $ (cd /tmp/rw && DATABASE_URL=postgresql://u:p@localhost/db SECRET_KEY=x /tmp/ve
     'import json;from app.main import app;print(json.dumps(app.openapi()))' > /tmp/rw_verdadero.json)
 $ spec-drift-radar --servidor /tmp/rw/app --openapi /tmp/rw_verdadero.json
 # RC 0 · archivos_py=72 · modelos=32 · rutas_codigo=19 · rutas_spec=19 · rojos=0 · avisos=4
+```
+
+Reproducir el tercer oráculo (324 apps, una verdad ejecutada por app):
+
+```console
+$ git clone --depth 1 https://github.com/fastapi/fastapi.git /tmp/fa
+$ git -C /tmp/fa rev-parse HEAD   # 05e6df7e906c3decba377c37548019973f40bf15
+$ python3.12 -m venv /tmp/venv_fa2 && /tmp/venv_fa2/bin/pip install \
+    fastapi pydantic python-multipart sqlmodel jinja2 itsdangerous pydantic-settings ujson
+$ # por cada docs_src/<dir>/*.py que contenga "= FastAPI(":
+$ #   copiarlo a /tmp/fa_apps/<dir>__<stem>/ y volcar app.openapi() a openapi.json
+$ #   (38 apps no se pueden importar: httpx2, uvicorn, orjson, static/ ausente)
+$ for d in /tmp/fa_apps/*/; do spec-drift-radar --servidor "$d" --openapi "$d/openapi.json" --json; done
+# 324 medidas · RC 0 = 321 · RC 1 = 0 · RC 2 = 3 (sin rutas publicadas)
 ```
 
 ## Familia

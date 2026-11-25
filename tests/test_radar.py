@@ -525,3 +525,145 @@ class TestContraUnSegundoProyecto:
         )
         op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
         assert op.codigos == (201,)
+
+
+class TestContraElCorpusDeFastAPI:
+    """La corrida contra los 324 ejemplos de `fastapi/fastapi@05e6df7` (`docs_src`).
+
+    Es el oraculo mas duro: cada app se **ejecuta** y su `app.openapi()` es la verdad, asi que
+    ningun defecto de nuestro lector puede justificarse como "lectura distinta". Los ocho de
+    abajo son los que este corpus encontro y que los dos oraculos anteriores no tocaban.
+    """
+
+    def test_anotated_con_metadatos_no_borra_el_parametro(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from typing import Annotated\nfrom fastapi import APIRouter, Body\n'
+            'from pydantic import BaseModel\n\nrouter = APIRouter()\n\n'
+            'class Item(BaseModel):\n    name: str\n\n'
+            '@router.put("/items/{id}")\ndef actualizar(id: int, item: Annotated[Item, Body(embed=True)]):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo) for c in op.peticion] == [("item", "object")]
+
+    def test_dos_cuerpos_se_embeben_cada_uno_bajo_su_nombre(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, Body\nfrom pydantic import BaseModel\n\n'
+            'router = APIRouter()\n\n'
+            'class Item(BaseModel):\n    name: str\n\n'
+            'class User(BaseModel):\n    username: str\n\n'
+            '@router.post("/x")\ndef crear(item: Item, user: User, importance: int = Body()):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo, c.requerido) for c in op.peticion] == [
+            ("item", "object", True), ("user", "object", True), ("importance", "integer", True),
+        ]
+
+    def test_lista_de_modelos_en_la_respuesta(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel\n\nrouter = APIRouter()\n\n'
+            'class Item(BaseModel):\n    name: str\n\n'
+            '@router.get("/items/", response_model=list[Item])\ndef leer():\n    return []\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo) for c in op.respuesta] == [("name", "string")]
+
+    def test_el_convertidor_de_ruta_no_es_parte_de_la_ruta(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n'
+            '@router.get("/files/{file_path:path}")\ndef leer(file_path: str):\n    return {}\n',
+            encoding="utf-8",
+        )
+        assert superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0].ruta == "/files/{file_path}"
+
+    def test_include_in_schema_false_no_se_publica(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\n\nrouter = APIRouter()\n\n'
+            '@router.get("/oculta", include_in_schema=False)\ndef oculta():\n    return {}\n\n'
+            '@router.get("/visible")\ndef visible():\n    return {}\n',
+            encoding="utf-8",
+        )
+        rutas = [op.ruta for op in superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones]
+        assert rutas == ["/visible"]
+
+    def test_mount_no_publica_las_rutas_del_hijo(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, FastAPI\n\napp = FastAPI()\nsubapi = APIRouter()\n\n'
+            '@app.get("/app")\ndef raiz():\n    return {}\n\n'
+            '@subapi.get("/sub")\ndef sub():\n    return {}\n\n'
+            'app.mount("/subapi", subapi)\n',
+            encoding="utf-8",
+        )
+        rutas = [op.ruta for op in superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones]
+        assert rutas == ["/app"]
+
+    def test_un_formulario_escalar_si_publica_su_campo(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from typing import Annotated\nfrom fastapi import APIRouter, File, Form\n'
+            'from fastapi import UploadFile\n\nrouter = APIRouter()\n\n'
+            '@router.post("/login/")\ndef login(username: Annotated[str, Form()],'
+            ' foto: Annotated[UploadFile, File()]):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo) for c in op.peticion] == [("username", "string"), ("foto", "string")]
+
+    def test_all_of_no_borra_los_escalares_del_mismo_nivel(self, tmp_path):
+        """FastAPI publica `<varios Form()>` como `allOf: [modelos]` **mas** sus `properties`."""
+        documento = {
+            "openapi": "3.1.0",
+            "info": {"title": "t", "version": "1"},
+            "paths": {"/p/": {"post": {"requestBody": {"content": {"application/x-www-form-urlencoded": {
+                "schema": {"$ref": "#/components/schemas/Body"}}}}, "responses": {"200": {}}}}},
+            "components": {"schemas": {
+                "Body": {"allOf": [{"$ref": "#/components/schemas/Perfil"}],
+                         "properties": {"token": {"type": "string"}}, "required": ["token"], "type": "object"},
+                "Perfil": {"properties": {"name": {"type": "string"}}, "required": ["name"], "type": "object"},
+            }},
+        }
+        op = superficie_openapi(documento).operaciones[0]
+        assert {c.nombre for c in op.peticion} == {"name", "token"}
+
+    def test_un_literal_se_publica_con_el_tipo_de_sus_valores(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from typing import Literal\nfrom fastapi import APIRouter\n'
+            'from pydantic import BaseModel\n\nrouter = APIRouter()\n\n'
+            'class Persona(BaseModel):\n    kind: Literal["person"]\n\n'
+            '@router.post("/x")\ndef crear(p: Persona):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo) for c in op.peticion] == [("kind", "string")]
+
+    def test_los_webhooks_no_son_rutas(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import FastAPI\n\napp = FastAPI()\n\n'
+            '@app.webhooks.post("new-subscription")\ndef aviso():\n    return {}\n\n'
+            '@app.get("/users/")\ndef leer():\n    return []\n',
+            encoding="utf-8",
+        )
+        rutas = sorted(op.ruta for op in superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones)
+        assert rutas == ["/users/", "webhooks/new-subscription"]
+
+    def test_un_router_de_callbacks_no_es_un_router_montado(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, FastAPI\n\napp = FastAPI()\ncb = APIRouter()\n\n'
+            '@cb.post("{$callback_url}/aviso")\ndef aviso():\n    return {}\n\n'
+            '@app.post("/pagar/", callbacks=cb.routes)\ndef pagar():\n    return {}\n',
+            encoding="utf-8",
+        )
+        rutas = [op.ruta for op in superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones]
+        assert rutas == ["/pagar/"]
+
+    def test_el_formulario_de_seguridad_declara_lo_que_no_mide(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from typing import Annotated\nfrom fastapi import APIRouter, Depends\n'
+            'from fastapi.security import OAuth2PasswordRequestForm\n\nrouter = APIRouter()\n\n'
+            '@router.post("/token")\ndef login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert servidor.operaciones[0].cuerpo_por_dependencia is True
+        assert servidor.marco["cuerpos_no_medidos_por_dependencia"] == 1

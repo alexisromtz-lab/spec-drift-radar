@@ -36,6 +36,8 @@ def _texto(codigo, spec, hallazgos, rc) -> str:
                   f" · rutas_sin_campos={codigo.marco['rutas_sin_campos']}"
                   f" · prefijos_no_medidos={codigo.marco['prefijos_no_medidos']}"
                   f" · inclusiones_condicionales={codigo.marco['inclusiones_condicionales']}"
+                  f" · cuerpos_declarados_a_mano={codigo.marco['cuerpos_declarados_a_mano']}"
+                  f" · cuerpos_no_medidos_por_dependencia={codigo.marco['cuerpos_no_medidos_por_dependencia']}"
                   f" · prefijo_base={codigo.marco['prefijo_base']}")
     lineas.append(f"MARCO DEL CONTRATO   openapi={spec.marco.get('openapi', 'NO_MEDIDO')}"
                   f" · titulo={spec.marco.get('titulo', 'NO_MEDIDO')}"

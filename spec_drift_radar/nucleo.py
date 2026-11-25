@@ -39,7 +39,9 @@ ESCALARES = {
     "SecretStr": "string",
     "IPvAnyAddress": "string",
     "date": "string",
-    "timedelta": "number",
+    "timedelta": "string",
+    "time": "string",
+    "UploadFile": "string",
     "Any": "any",
     "list": "array",
     "List": "array",
@@ -72,6 +74,8 @@ class Operacion:
     codigos: tuple
     fuente: str
     condicional: bool = False
+    cuerpo_manual: bool = False
+    cuerpo_por_dependencia: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,38 @@ class Hallazgo:
 # --- lector 1: AST del servidor ---------------------------------------------
 
 
+GENERICOS_DE_UN_SOLO_ARG = ("Optional[", "list[", "List[", "Sequence[", "set[", "Set[", "tuple[", "Tuple[")
+
+
+def _anotada(annotation):
+    """`Annotated[T, Body(embed=True)]` -> (T, [metadatos]). La metadata es donde FastAPI vive."""
+    if isinstance(annotation, ast.Subscript) and ast.unparse(annotation.value).split(".")[-1] == "Annotated":
+        rebanada = annotation.slice
+        elementos = rebanada.elts if isinstance(rebanada, ast.Tuple) else [rebanada]
+        if elementos:
+            return elementos[0], [e for e in elementos[1:] if isinstance(e, ast.Call)]
+    return annotation, []
+
+
+def _desnudo(annotation):
+    """Quita `Annotated`, `Optional`, `| None` y los genericos de un solo argumento del tipo."""
+    actual = annotation
+    for _ in range(8):
+        actual, _meta = _anotada(actual)
+        if isinstance(actual, ast.BinOp) and isinstance(actual.op, ast.BitOr):
+            siguiente = actual.right if isinstance(actual.right, ast.Constant) and actual.right.value is None else actual.left
+            if ast.unparse(siguiente) in ("None", "NoneType"):
+                siguiente = actual.left
+            actual = siguiente
+            continue
+        texto = ast.unparse(actual).replace(" ", "")
+        prefijo = next((g for g in GENERICOS_DE_UN_SOLO_ARG if texto.startswith(g) and texto.endswith("]")), None)
+        if prefijo is None:
+            break
+        actual = ast.parse(texto[len(prefijo) : -1], mode="eval").body
+    return actual
+
+
 def _tipo_py(anotacion: str, modelos) -> tuple:
     """(tipo normalizado, es_opcional_por_anotacion)."""
     t = anotacion.replace(" ", "")
@@ -115,12 +151,48 @@ def _tipo_py(anotacion: str, modelos) -> tuple:
         if t.startswith(prefijo):
             return "object", opcional
     base = t.split("[")[0].split(".")[-1]
+    if base == "Literal" and t.endswith("]"):
+        # `Literal["person"]` se publica como `type: string` (con `const`): el tipo medible es el de sus valores.
+        tipos = {_tipo_de_literal(valor) for valor in _partir_argumentos(t[len("Literal[") : -1])}
+        return (tipos.pop() if len(tipos) == 1 else "any"), opcional
     if base in modelos:
         return "object", opcional
     if base in ESCALARES:
         return ESCALARES[base], opcional
     escalares = {nombre.lower(): tipo for nombre, tipo in ESCALARES.items()}
     return escalares.get(base.lower(), base.lower()), opcional
+
+
+def _tipo_de_literal(valor: str) -> str:
+    """Tipo JSON de un valor de `Literal[...]`: `"person"` publica `string`, `1` publica `integer`."""
+    v = valor.strip()
+    if len(v) > 1 and v[0] in "\"'" and v[-1] == v[0]:
+        return "string"
+    if v in ("True", "False"):
+        return "boolean"
+    try:
+        numero = float(v)
+        return "integer" if numero.is_integer() and "." not in v else "number"
+    except ValueError:
+        return "any"
+
+
+def _partir_argumentos(texto: str) -> list:
+    """Parte argumentos de un generico respetando los corchetes anidados."""
+    partes, profundidad, actual = [], 0, ""
+    for caracter in texto:
+        if caracter in "[(":
+            profundidad += 1
+        elif caracter in "])":
+            profundidad -= 1
+        if caracter == "," and profundidad == 0:
+            partes.append(actual.strip())
+            actual = ""
+            continue
+        actual += caracter
+    if actual.strip():
+        partes.append(actual.strip())
+    return partes
 
 
 def _nombres_modelos(arboles) -> set:
@@ -135,6 +207,8 @@ def _nombres_modelos(arboles) -> set:
         for nodo in ast.walk(arbol):
             if isinstance(nodo, ast.ClassDef):
                 bases = {ast.unparse(b).split(".")[-1] for b in nodo.bases}
+                if any(ast.unparse(d).split(".")[-1].startswith("dataclass") for d in nodo.decorator_list):
+                    bases.add("BaseModel")  # `@dataclass` de pydantic publica esquema igual que un modelo
                 candidatos.setdefault(nodo.name, set()).update(bases)
     nombres = {nombre for nombre, bases in candidatos.items() if bases & BASES_MODELO}
     for _ in range(8):
@@ -164,7 +238,7 @@ def _tiene_valor_por_defecto(valor) -> bool:
     if not isinstance(valor, ast.Call):
         return True
     nombre = ast.unparse(valor.func).split(".")[-1]
-    if nombre not in ("Field", "Column", "Body", "Form", "File"):
+    if nombre not in ("Field", "Column", "Body", "Form", "File", "field"):
         return True
     return not _requerido_en_llamada(valor)
 
@@ -257,15 +331,10 @@ def _modelos(arboles, nombres) -> dict:
 
 
 def _modelo_de(anotacion: str, modelos) -> str | None:
-    base = anotacion.replace(" ", "").split("[")[0].split(".")[-1]
-    if base in modelos:
-        return base
-    interior = anotacion.replace(" ", "")
-    if interior.startswith("Optional[") and interior.endswith("]"):
-        base = interior[len("Optional[") : -1].split("[")[0].split(".")[-1]
-        if base in modelos:
-            return base
-    return None
+    """El modelo que un tipo publica, dentro de `list[...]`, `Optional[...]` o `Annotated[...]`."""
+    nodo = _desnudo(ast.parse(anotacion, mode="eval").body)
+    base = ast.unparse(nodo).split(".")[-1]
+    return base if base in modelos else None
 
 
 def _codigo_de(nodo):
@@ -278,6 +347,14 @@ def _codigo_de(nodo):
         if encontrado:
             return int(encontrado.group(1))
     return None
+
+
+def _omitida(dec: ast.Call) -> bool:
+    """`include_in_schema=False` deja la ruta fuera del contrato: no es una ruta, es un handler."""
+    for kw in dec.keywords:
+        if kw.arg == "include_in_schema" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+            return True
+    return False
 
 
 def _kwargs_decorador(dec: ast.Call, modelos) -> tuple:
@@ -330,34 +407,96 @@ def _llamada(valor) -> str | None:
     return ast.unparse(valor.func).split(".")[-1] if isinstance(valor, ast.Call) else None
 
 
+def _metadatos_de(annotation) -> list:
+    return _anotada(annotation)[1]
+
+
+def _llamada_del_parametro(argumento, defecto) -> tuple:
+    """(nombre de la llamada que da semantica al parametro, nodo de la llamada).
+
+    `Annotated[Session, Depends(get_db)]` pone la dependencia en la metadata; sin mirarla, cada
+    `Depends` del estilo moderno se leia como cuerpo.
+    """
+    for meta in _metadatos_de(argumento.annotation):
+        nombre = _llamada(meta)
+        if nombre in NO_VIAJAN_EN_EL_CUERPO or nombre in ("Body", "Form", "File"):
+            return nombre, meta
+    return _llamada(defecto), defecto
+
+
+def _opciones_de_cuerpo(llamada) -> tuple:
+    alias, embed = None, False
+    if isinstance(llamada, ast.Call):
+        for kw in llamada.keywords:
+            if kw.arg == "alias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                alias = kw.value.value
+            if kw.arg == "embed" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                embed = True
+    return alias, embed
+
+
+FORMULARIOS_POR_DEPENDENCIA = {"OAuth2PasswordRequestForm", "OAuth2PasswordRequestFormStrict"}
+
+
+def _formulario_por_dependencia(nodo) -> bool:
+    """`depend: OAuth2PasswordRequestForm = Depends()` publica 6 campos de formulario que no estan
+    en el AST: la clase vive en `fastapi.security`. Adivinar sus campos seria inventar el contrato."""
+    for argumento, _defecto in _parametros(nodo):
+        for fuente in (argumento.annotation, _anotada(argumento.annotation)[0]):
+            if fuente is None:
+                continue
+            base = ast.unparse(fuente).replace(" ", "").split("[")[0].split(".")[-1]
+            if base in FORMULARIOS_POR_DEPENDENCIA:
+                return True
+    return False
+
+
 def _cuerpo_de_peticion(nodo, modelos) -> tuple:
     """El cuerpo son los campos del modelo anotado, salvo que el parametro sea una dependencia.
 
     `articles_repo: ArticlesRepository = Depends(get_repository(...))` no viaja en el cuerpo:
     leerlo como cuerpo convertia cada `Depends` con modelo en 4 campos fantasma por operacion.
+    Con **mas de un** parametro de cuerpo, FastAPI embebe cada uno bajo su nombre: sin eso, dos
+    modelos se fundian en una sola lista de campos que el contrato nunca publica.
     """
-    campos, embebido = (), None
+    partes = []
     for argumento, defecto in _parametros(nodo):
-        llamada = _llamada(defecto)
+        llamada, nodo_llamada = _llamada_del_parametro(argumento, defecto)
         if llamada in NO_VIAJAN_EN_EL_CUERPO:
             continue
+        anotada, _meta = _anotada(argumento.annotation)
         nombre_modelo = _modelo_de(ast.unparse(argumento.annotation), modelos)
-        if llamada in ("Body", "Form", "File"):
-            alias, embed = None, False
-            for kw in defecto.keywords:
-                if kw.arg == "alias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
-                    alias = kw.value.value
-                if kw.arg == "embed" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                    embed = True
-            if embed:
-                embebido = Campo(alias or argumento.arg, "object", _requerido_en_llamada(defecto))
-                continue
-            if nombre_modelo:
-                campos += modelos[nombre_modelo]
+        # Requerido = la firma no da default (`= None` lo da) y la llamada tampoco (`Body(None)` lo da).
+        base = defecto is None or _requerido_en_llamada(defecto)
+        formulario = llamada in ("Form", "File") or "UploadFile" in ast.unparse(anotada)
+        if llamada in ("Body", "Form", "File") or formulario:
+            alias, embed = _opciones_de_cuerpo(nodo_llamada)
+            requerido = base and _requerido_en_llamada(nodo_llamada) if isinstance(nodo_llamada, ast.Call) else base
+            tipo = "object" if nombre_modelo else _tipo_py(ast.unparse(anotada), modelos)[0]
+            partes.append((alias or argumento.arg, nombre_modelo, requerido, embed, formulario, tipo))
             continue
         if nombre_modelo:
-            campos += modelos[nombre_modelo]
-    return (embebido,) if embebido else campos
+            partes.append((argumento.arg, nombre_modelo, base, False, False, "object"))
+
+    if not partes:
+        return ()
+    if len(partes) == 1 and not partes[0][3] and partes[0][1]:
+        return modelos[partes[0][1]]
+    if len(partes) == 1 and not partes[0][3] and partes[0][5] != "object" and not partes[0][4]:
+        return ()  # un escalar suelto en `Body()` es el cuerpo entero, sin propiedades nombradas
+    if all(parte[4] for parte in partes):
+        # Formulario: los campos no se embeben bajo el nombre del parametro, se publican sueltos,
+        # y un modelo de formulario ni siquiera llega al contrato (limite de FastAPI, no nuestro).
+        campos = []
+        for _n, modelo, requerido, _e, _f, tipo in partes:
+            campos += list(modelos[modelo]) if modelo else [Campo(_n, tipo, requerido)]
+        return tuple(campos)
+    return tuple(Campo(nombre, tipo, requerido) for nombre, _m, requerido, _e, _fav, tipo in partes)
+
+
+def _sin_convertidor(camino: str) -> str:
+    """`/files/{file_path:path}` se publica como `/files/{file_path}`: el convertidor no viaja."""
+    return re.sub(r"\{([^{}:]+):[^{}]+\}", r"{\1}", camino)
 
 
 def _prefijos_de_router(arbol) -> dict:
@@ -462,6 +601,8 @@ class _Indice:
         self.imports = {m: _importados_de(a) for m, a in self.modulos.items()}
         self.prefijos = {(m, n): p for m, a in self.modulos.items() for n, p in _prefijos_de_router(a).items()}
         self.constantes = {}
+        self.montados = set()
+        self.retrollamadas = set()
         self.atributos = collections.defaultdict(set)
         for modulo, (propias, de_clase) in self.cadenas.items():
             for nombre, valor in propias.items():
@@ -550,6 +691,19 @@ class _Indice:
             for nodo in ast.walk(arbol):
                 if not (isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Attribute)):
                     continue
+                for kw in nodo.keywords:
+                    if kw.arg == "callbacks":
+                        # `callbacks=router.routes` publica esas rutas bajo el arbol del llamante,
+                        # no en `paths`: leerlas como rutas propias inventa una ruta que no existe.
+                        valor = kw.value.value if isinstance(kw.value, ast.Attribute) else kw.value
+                        if isinstance(valor, ast.Name):
+                            self.retrollamadas.add((modulo, valor.id))
+                if nodo.func.attr == "mount" and len(nodo.args) >= 2:
+                    # `app.mount("/subapi", subapi)` no publica las rutas del hijo en el esquema del padre.
+                    montado = self.referencia(nodo.args[1], modulo) if len(nodo.args) >= 2 else None
+                    if montado is not None:
+                        self.montados.add(montado)
+                    continue
                 if nodo.func.attr != "include_router" or not nodo.args:
                     continue
                 host = self.referencia(nodo.func.value, modulo)
@@ -625,7 +779,7 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
     if not prefijo_base:
         sin_medir.extend(ajenos)
 
-    operaciones, vistas = [], {}
+    operaciones, vistas, declarados, por_dep = [], {}, 0, 0
     for ruta, arbol in arboles:
         modulo = _modulo_de(ruta, pathlib.Path(raiz))
         for nodo in ast.walk(arbol):
@@ -640,6 +794,9 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
                 camino = None
                 if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
                     camino = dec.args[0].value
+                claves = {kw.arg for kw in dec.keywords}
+                if _omitida(dec):
+                    continue
                 codigos, respuesta = _kwargs_decorador(dec, modelos)
                 if not respuesta:
                     respuesta = _anotacion_de_retorno(nodo, modelos)
@@ -648,16 +805,33 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
                     sin_medir.append(f"{ruta}:{nodo.lineno} ruta no literal en {metodo}")
                     continue
                 nombre_router = ast.unparse(dec.func.value)
+                if (modulo, nombre_router) in indice.montados or (modulo, nombre_router) in indice.retrollamadas:
+                    continue
+                if isinstance(dec.func.value, ast.Attribute) and dec.func.value.attr == "webhooks":
+                    # `@app.webhooks.post("x")` se publica en la seccion `webhooks`, no en `paths`.
+                    gancho = _sin_convertidor(f"webhooks/{camino}")
+                    if (metodo, gancho) not in vistas:
+                        vistas[(metodo, gancho)] = False
+                        operaciones.append(Operacion(metodo, gancho, peticion, respuesta, codigos,
+                                                     f"{ruta}:{nodo.lineno}", False, False))
+                    continue
                 propio = indice.prefijos.get((modulo, nombre_router), "")
                 for prefijo, condicional in sorted((montaje.get((modulo, nombre_router)) or {"": False}).items()):
-                    completa = _une(prefijo_base, _une(_une(prefijo, propio), camino))
+                    completa = _sin_convertidor(_une(prefijo_base, _une(_une(prefijo, propio), camino)))
                     if (metodo, completa) in vistas:
                         if not condicional:
                             vistas[(metodo, completa)] = False
                         continue
                     vistas[(metodo, completa)] = condicional
+                    manual = "openapi_extra" in claves
+                    if manual:
+                        peticion = ()
+                        declarados += 1
+                    por_dependencia = _formulario_por_dependencia(nodo)
+                    if por_dependencia:
+                        por_dep += 1
                     operaciones.append(Operacion(metodo, completa, peticion, respuesta, codigos,
-                                                 f"{ruta}:{nodo.lineno}", condicional))
+                                                 f"{ruta}:{nodo.lineno}", condicional, manual, por_dependencia))
 
     con_campos = sum(1 for op in operaciones if op.peticion or op.respuesta)
     marco = {
@@ -669,6 +843,8 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
         "prefijos_no_medidos": len(ajenos),
         "prefijo_base": prefijo_base or "NO_DECLARADO",
         "inclusiones_condicionales": condicionales,
+        "cuerpos_declarados_a_mano": declarados,
+        "cuerpos_no_medidos_por_dependencia": por_dep,
         "sin_lector": ["typescript", "yaml"],
     }
     return Superficie("servidor", tuple(operaciones), len(arboles), len(modelos), tuple(sin_medir), marco)
@@ -715,24 +891,66 @@ def _tipo_de(definicion: dict, componentes: dict, profundidad: int = 0) -> str:
     return "any"
 
 
-def _campos_schema(schema: dict, componentes: dict) -> tuple:
+def _desenvuelto(schema: dict, componentes: dict, profundidad: int = 0) -> dict:
+    """El schema del que cuelgan los campos, sin `$ref`, `anyOf` de union ni envoltorio de array.
+
+    `Item | None` se publica como `anyOf: [Item, null]`: la rama que no es nula es el modelo.
+    """
     schema = _resolver(schema, componentes)
+    if not isinstance(schema, dict) or profundidad > 4:
+        return {}
+    for clave in ("anyOf", "oneOf"):
+        ramas = [r for r in (schema.get(clave) or ()) if (_resolver(r, componentes) or {}).get("type") != "null"]
+        if ramas:
+            # Pydantic v2 envuelve `Profile | None` en `anyOf: [{not: ...}, {anyOf: [Profile]}]`:
+            # la rama con campos puede estar a dos `anyOf` de distancia, no en el primer nivel.
+            resueltas = [_desenvuelto(rama, componentes, profundidad + 1) for rama in ramas]
+            con_propiedades = [rama for rama in resueltas if rama.get("properties")]
+            if con_propiedades:
+                return con_propiedades[0]
+            return resueltas[0] if resueltas else {}
     if schema.get("type") == "array" or "items" in schema:
-        schema = _resolver(schema.get("items") or {}, componentes)
-    propiedades = schema.get("properties") or {}
-    requeridos = set(schema.get("required") or ())
-    campos = [
+        return _desenvuelto(schema.get("items") or {}, componentes, profundidad + 1)
+    return schema
+
+
+def _propiedades_declaradas(schema: dict, componentes: dict, profundidad: int = 0) -> tuple:
+    """Propiedades y requeridos de un schema, **fusionando** `allOf` con las propias.
+
+    FastAPI publica un cuerpo con varios `Body()`/`Form()` como un schema con `allOf` de los modelos
+    embebidos **y** sus `properties` escalares en el mismo nivel. Quedarse con una sola rama borraba
+    los escalares del contrato y convertia un contrato completo en una deriva falsa.
+    """
+    schema = _desenvuelto(schema, componentes, profundidad)
+    propiedades, requeridos = {}, set()
+    if not isinstance(schema, dict) or profundidad > 4:
+        return propiedades, requeridos
+    for rama in schema.get("allOf") or ():
+        heredadas, obligatorias = _propiedades_declaradas(rama, componentes, profundidad + 1)
+        propiedades.update(heredadas)
+        requeridos |= obligatorias
+    propiedades.update(schema.get("properties") or {})
+    requeridos |= set(schema.get("required") or ())
+    return propiedades, requeridos
+
+
+def _campos_schema(schema: dict, componentes: dict) -> tuple:
+    propiedades, requeridos = _propiedades_declaradas(schema, componentes)
+    return tuple(
         Campo(nombre, _tipo_de(definicion, componentes), nombre in requeridos)
         for nombre, definicion in propiedades.items()
-    ]
-    return tuple(campos)
+    )
 
 
 def _cuerpo(op: dict) -> dict:
+    """El cuerpo declarado, sea JSON o de formulario: los nombres se comparan igual."""
     contenido = (op.get("requestBody") or {}).get("content") or {}
     for tipo, valor in contenido.items():
         if "json" in tipo:
             return valor.get("schema") or {}
+    for valor in contenido.values():
+        if isinstance(valor, dict) and valor.get("schema"):
+            return valor["schema"]
     return {}
 
 
@@ -754,25 +972,27 @@ def superficie_openapi(documento: dict) -> Superficie:
     if not isinstance(documento, dict):
         return Superficie("openapi", (), 0, 0, ("el documento no es un objeto JSON",), {})
     componentes = ((documento.get("components") or {}).get("schemas")) or {}
-    paths = documento.get("paths") or {}
+    # `webhooks` es una seccion hermana de `paths` (OpenAPI 3.1): mismo lector, otro espacio de nombres.
+    secciones = [("", documento.get("paths") or {}), ("webhooks/", documento.get("webhooks") or {})]
     operaciones = []
-    for camino, item in paths.items():
-        if not isinstance(item, dict):
-            continue
-        for metodo, op in item.items():
-            if metodo.lower() not in METODOS or not isinstance(op, dict):
+    for prefijo, caminos in secciones:
+        for camino, item in (caminos.items() if isinstance(caminos, dict) else ()):
+            if not isinstance(item, dict):
                 continue
-            codigos = tuple(sorted(int(c) for c in (op.get("responses") or {}) if str(c).isdigit()))
-            operaciones.append(
-                Operacion(
-                    metodo.lower(),
-                    camino,
-                    _campos_schema(_cuerpo(op), componentes),
-                    _campos_schema(_respuesta(op), componentes),
-                    codigos,
-                    "openapi",
+            for metodo, op in item.items():
+                if metodo.lower() not in METODOS or not isinstance(op, dict):
+                    continue
+                codigos = tuple(sorted(int(c) for c in (op.get("responses") or {}) if str(c).isdigit()))
+                operaciones.append(
+                    Operacion(
+                        metodo.lower(),
+                        _sin_convertidor(f"{prefijo}{camino}"),
+                        _campos_schema(_cuerpo(op), componentes),
+                        _campos_schema(_respuesta(op), componentes),
+                        codigos,
+                        "openapi",
+                    )
                 )
-            )
     info = documento.get("info") or {}
     marco = {
         "openapi": documento.get("openapi") or documento.get("swagger") or "NO_MEDIDO",
@@ -846,7 +1066,12 @@ def comparar(codigo: Superficie, spec: Superficie) -> list:
                                       "el contrato la publica y el servidor no la declara", "ROJO"))
     for clave in sorted(set(indice_codigo) & set(indice_spec), key=lambda k: (k[1], k[0])):
         a, b = indice_codigo[clave], indice_spec[clave]
-        hallazgos.extend(_divergencias(a.peticion, b.peticion, a.metodo, a.ruta, "cuerpo"))
+        if a.cuerpo_por_dependencia or b.cuerpo_por_dependencia:
+            hallazgos.append(Hallazgo("CUERPO_NO_MEDIDO_POR_DEPENDENCIA", a.metodo, a.ruta,
+                                      "el cuerpo viaja en un formulario de seguridad que este lector no calcula"
+                                      " desde el AST; los campos del contrato no se comparan", "WARN"))
+        elif not (a.cuerpo_manual or b.cuerpo_manual):
+            hallazgos.extend(_divergencias(a.peticion, b.peticion, a.metodo, a.ruta, "cuerpo"))
         hallazgos.extend(_divergencias(a.respuesta, b.respuesta, a.metodo, a.ruta, "respuesta"))
         exitos_codigo = {c for c in a.codigos if 200 <= c < 300}
         exitos_spec = {c for c in b.codigos if 200 <= c < 300}
