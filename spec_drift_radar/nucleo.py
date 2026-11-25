@@ -9,7 +9,9 @@ mide formato.
 from __future__ import annotations
 
 import ast
+import collections
 import json
+import os
 import pathlib
 import re
 from dataclasses import dataclass
@@ -25,7 +27,19 @@ ESCALARES = {
     "date": "string",
     "datetime": "string",
     "UUID": "string",
+    "uuid": "string",
     "Decimal": "number",
+    "EmailStr": "string",
+    "NameEmail": "string",
+    "HttpUrl": "string",
+    "AnyHttpUrl": "string",
+    "AnyUrl": "string",
+    "PostgresDsn": "string",
+    "AnyWebsocketUrl": "string",
+    "SecretStr": "string",
+    "IPvAnyAddress": "string",
+    "date": "string",
+    "timedelta": "number",
     "Any": "any",
     "list": "array",
     "List": "array",
@@ -56,6 +70,7 @@ class Operacion:
     respuesta: tuple
     codigos: tuple
     fuente: str
+    condicional: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,7 +116,10 @@ def _tipo_py(anotacion: str, modelos) -> tuple:
     base = t.split("[")[0].split(".")[-1]
     if base in modelos:
         return "object", opcional
-    return ESCALARES.get(base, base.lower()), opcional
+    if base in ESCALARES:
+        return ESCALARES[base], opcional
+    escalares = {nombre.lower(): tipo for nombre, tipo in ESCALARES.items()}
+    return escalares.get(base.lower(), base.lower()), opcional
 
 
 def _nombres_modelos(arboles) -> set:
@@ -126,13 +144,29 @@ def _nombres_modelos(arboles) -> set:
     return nombres
 
 
+def _tiene_valor_por_defecto(valor) -> bool:
+    """`title: str = Field(min_length=1)` no tiene default: `Field()` no es un valor, es configuracion.
+
+    Solo `Field(123)`, `Field(default=...)` o `Field(default_factory=...)` dan un default;
+    confundirlos marcaba como opcional casi todo campo de una app SQLModel/Pydantic v2.
+    """
+    if not isinstance(valor, ast.Call):
+        return True
+    nombre = ast.unparse(valor.func).split(".")[-1]
+    if nombre not in ("Field", "Column"):
+        return True
+    if valor.args:
+        return True
+    return any(kw.arg in ("default", "default_factory") for kw in valor.keywords)
+
+
 def _campos_propios(clase: ast.ClassDef, modelos) -> list:
     campos = []
     for item in clase.body:
         if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
             continue
         tipo, opcional = _tipo_py(ast.unparse(item.annotation), modelos)
-        requerido = not (opcional or item.value is not None)
+        requerido = not (opcional or (item.value is not None and _tiene_valor_por_defecto(item.value)))
         campos.append(Campo(item.target.id, tipo, requerido))
     return campos
 
@@ -212,8 +246,24 @@ def _kwargs_decorador(dec: ast.Call, modelos) -> tuple:
     return tuple(codigos), respuesta
 
 
+def _anotacion_de_retorno(nodo, modelos) -> tuple:
+    """`def f(...) -> Token`: sin `response_model`, la respuesta la dice el retorno."""
+    if nodo.returns is None:
+        return ()
+    nombre = _modelo_de(ast.unparse(nodo.returns), modelos)
+    return modelos[nombre] if nombre else ()
+
+
+def _parametros(nodo) -> list:
+    """Incluye los `*` keyword-only: `def f(*, user_in: UserUpdate)` no esta en args.args."""
+    argumentos = list(nodo.args.posonlyargs) + list(nodo.args.args) + list(nodo.args.kwonlyargs)
+    if argumentos and argumentos[0].arg in ("self", "cls"):
+        argumentos = argumentos[1:]
+    return [a for a in argumentos if a.annotation is not None]
+
+
 def _prefijos_de_router(arbol) -> dict:
-    """Prefijo estatico de cada router del modulo: `router = APIRouter(prefix="/users")`."""
+    """Prefijo propio de cada router del modulo: `router = APIRouter(prefix="/users")`."""
     prefijos = {}
 
     def anotar(objetivo, valor):
@@ -237,30 +287,225 @@ def _prefijos_de_router(arbol) -> dict:
 
 
 def _une(prefijo: str, camino: str) -> str:
+    """Une sin perder la barra final: FastAPI publica `/items/` y `/items` como rutas distintas."""
     if not prefijo:
         return camino
+    cola = "/" if camino.endswith("/") else ""
     partes = [p for p in (prefijo.strip("/"), camino.strip("/")) if p]
-    return "/" + "/".join(partes)
+    return "/" + "/".join(partes) + cola
 
 
-def _prefijos_no_medidos(arbol, ruta) -> list:
-    notas = []
+def _modulo_de(ruta: pathlib.Path, raiz: pathlib.Path) -> str:
+    try:
+        relativa = ruta.relative_to(raiz)
+    except ValueError:
+        relativa = pathlib.Path(ruta.name)
+    partes = list(relativa.with_suffix("").parts)
+    if partes and partes[-1] == "__init__":
+        partes.pop()
+    return ".".join(partes)
+
+
+def _cadenas_de(arbol) -> tuple:
+    """Literales de cadena: `API_V1_STR = "/api/v1"` y atributos de clase `Clase.X = "..."`."""
+    propias, de_clase = {}, {}
+    for nodo in arbol.body:
+        if isinstance(nodo, (ast.Assign, ast.AnnAssign)):
+            objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
+            if isinstance(nodo.value, ast.Constant) and isinstance(nodo.value.value, str):
+                for objetivo in objetivos:
+                    if isinstance(objetivo, ast.Name):
+                        propias[objetivo.id] = nodo.value.value
+        elif isinstance(nodo, ast.ClassDef):
+            for hijo in nodo.body:
+                if not isinstance(hijo, (ast.Assign, ast.AnnAssign)):
+                    continue
+                if not (isinstance(hijo.value, ast.Constant) and isinstance(hijo.value.value, str)):
+                    continue
+                objetivos = hijo.targets if isinstance(hijo, ast.Assign) else [hijo.target]
+                for objetivo in objetivos:
+                    if isinstance(objetivo, ast.Name):
+                        de_clase.setdefault(objetivo.id, set()).add(hijo.value.value)
+    return propias, de_clase
+
+
+def _importados_de(arbol) -> dict:
+    """`from a.b import router as r` ⇒ r -> (modulo base, atributo); `import a.b as x` ⇒ x -> (a.b, None)."""
+    importados = {}
     for nodo in ast.walk(arbol):
-        if not isinstance(nodo, ast.Call) or not isinstance(nodo.func, ast.Attribute):
-            continue
-        if nodo.func.attr != "include_router":
-            continue
-        for kw in nodo.keywords:
-            literal = isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)
-            if kw.arg == "prefix" and not literal:
-                notas.append(
-                    f"{ruta}:{nodo.lineno} include_router con prefijo no literal ({ast.unparse(kw.value)}):"
-                    " las rutas incluidas no llevan ese prefijo"
-                )
-    return notas
+        if isinstance(nodo, ast.ImportFrom):
+            for alias in nodo.names:
+                importados[alias.asname or alias.name] = (nodo.module or "", alias.name, nodo.level)
+        elif isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                if alias.asname:
+                    importados[alias.asname] = (alias.name, None, 0)
+    return importados
 
 
-def superficie_servidor(rutas: list, prefijo_base: str = "") -> Superficie:
+def _buscar_modulo(nombre: str, modulos) -> str | None:
+    """Los imports suelen ser absolutos (`app.api.routes.users`) y el indice relativo (`api.routes.users`)."""
+    if not nombre:
+        return None
+    partes = nombre.split(".")
+    for desde in range(len(partes)):
+        candidato = ".".join(partes[desde:])
+        if candidato in modulos:
+            return candidato
+    return None
+
+
+class _Indice:
+    """Todo lo que hay que saber de un proyecto para resolver un prefijo de montaje."""
+
+    def __init__(self, arboles, raiz):
+        self.modulos = {_modulo_de(ruta, raiz): arbol for ruta, arbol in arboles}
+        self.cadenas = {m: _cadenas_de(a) for m, a in self.modulos.items()}
+        self.imports = {m: _importados_de(a) for m, a in self.modulos.items()}
+        self.prefijos = {(m, n): p for m, a in self.modulos.items() for n, p in _prefijos_de_router(a).items()}
+        self.constantes = {}
+        self.atributos = collections.defaultdict(set)
+        for modulo, (propias, de_clase) in self.cadenas.items():
+            for nombre, valor in propias.items():
+                self.constantes[(modulo, nombre)] = valor
+            for nombre, valores in de_clase.items():
+                self.atributos[nombre] |= valores
+                if len(valores) == 1:
+                    self.constantes.setdefault((modulo, nombre), next(iter(valores)))
+
+    def valor(self, expr, modulo) -> str | None:
+        propias = self.cadenas[modulo][0]
+        importados = self.imports[modulo]
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        if isinstance(expr, ast.JoinedStr):
+            partes = []
+            for valor in expr.values:
+                if isinstance(valor, ast.Constant) and isinstance(valor.value, str):
+                    partes.append(valor.value)
+                elif isinstance(valor, ast.FormattedValue):
+                    resuelto = self.valor(valor.value, modulo)
+                    if resuelto is None:
+                        return None
+                    partes.append(resuelto)
+                else:
+                    return None
+            return "".join(partes)
+        if isinstance(expr, ast.Name):
+            if expr.id in propias:
+                return propias[expr.id]
+            if expr.id in importados:
+                base, atributo, _ = importados[expr.id]
+                destino = _buscar_modulo(base, self.modulos) if base else None
+                if destino and atributo and (destino, atributo) in self.constantes:
+                    return self.constantes[(destino, atributo)]
+            return None
+        if isinstance(expr, ast.Attribute):
+            base = expr.value
+            if isinstance(base, ast.Name) and base.id in importados:
+                modulo_base, nombre, _ = importados[base.id]
+                candidatos = [f"{modulo_base}.{nombre}" if nombre else modulo_base, modulo_base]
+                for candidato in candidatos:
+                    destino = _buscar_modulo(candidato, self.modulos) if candidato else None
+                    if destino and (destino, expr.attr) in self.constantes:
+                        return self.constantes[(destino, expr.attr)]
+            valores = self.atributos.get(expr.attr)
+            if valores and len(valores) == 1:
+                return next(iter(valores))
+        return None
+
+    def referencia(self, expr, modulo):
+        """A que (modulo, router) apunta una expresion usada como destino de include_router."""
+        importados = self.imports[modulo]
+        if isinstance(expr, ast.Name):
+            if expr.id in importados:
+                base, atributo, _ = importados[expr.id]
+                if atributo is None:
+                    destino = _buscar_modulo(base, self.modulos)
+                    return (destino, None) if destino else None
+                completo = _buscar_modulo(f"{base}.{atributo}", self.modulos) if base else None
+                if completo:
+                    return (completo, None)
+                destino = _buscar_modulo(base, self.modulos) if base else None
+                return (destino, atributo) if destino else None
+            return (modulo, expr.id)
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+            base = expr.value.id
+            if base in importados:
+                modulo_base, nombre, _ = importados[base]
+                candidatos = [f"{modulo_base}.{nombre}" if nombre else modulo_base, modulo_base]
+                for candidato in candidatos:
+                    destino = _buscar_modulo(candidato, self.modulos) if candidato else None
+                    if destino:
+                        return (destino, expr.attr)
+        return None
+
+    def aristas(self, ajenos: list) -> tuple:
+        """Grafo de montaje: (host_modulo, host_router) -> (destino, prefijo). y cuantas son condicionales."""
+        aristas, condicionales = [], 0
+        for modulo, arbol in self.modulos.items():
+            condicionales_nodos = set()
+            for nodo in ast.walk(arbol):
+                if isinstance(nodo, (ast.If, ast.Try, ast.While, ast.For, ast.AsyncFor)):
+                    for hijo in ast.walk(nodo):
+                        condicionales_nodos.add(id(hijo))
+            for nodo in ast.walk(arbol):
+                if not (isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Attribute)):
+                    continue
+                if nodo.func.attr != "include_router" or not nodo.args:
+                    continue
+                host = self.referencia(nodo.func.value, modulo)
+                destino = self.referencia(nodo.args[0], modulo)
+                if destino is None:
+                    ajenos.append(f"{modulo}: include_router con destino no resoluble ({ast.unparse(nodo.args[0])})")
+                    continue
+                prefijo, declarado = "", True
+                for kw in nodo.keywords:
+                    if kw.arg != "prefix":
+                        continue
+                    resuelto = self.valor(kw.value, modulo)
+                    if resuelto is None:
+                        declarado = False
+                        ajenos.append(f"{modulo}:{nodo.lineno} include_router con prefijo no resoluble"
+                                      f" ({ast.unparse(kw.value)}): las rutas montadas ahi no llevan ese prefijo")
+                    else:
+                        prefijo = resuelto
+                condicional = id(nodo) in condicionales_nodos
+                if condicional:
+                    condicionales += 1
+                aristas.append((host, destino, prefijo, declarado, condicional))
+        return aristas, condicionales
+
+    def montajes(self, aristas) -> dict:
+        """Prefijos con los que se alcanza cada router: {(modulo, router): {prefijo: condicional}}.
+
+        Un `include_router` dentro de un `if` o un `try` no se puede decidir sin ejecutar:
+        se marca condicional y todas sus rutas heredan la marca.
+        """
+        destinos = {destino for _, destino, _, _, _ in aristas}
+        semillas = [((modulo, nombre), "", False)
+                    for modulo, nombre in self.prefijos if (modulo, nombre) not in destinos]
+        por_host = collections.defaultdict(list)
+        for host, destino, prefijo, _, condicional in aristas:
+            if host is None:
+                semillas.append((destino, prefijo, condicional))
+            else:
+                por_host[host].append((destino, prefijo, condicional))
+        montaje = collections.defaultdict(dict)
+        cola = collections.deque(semillas)
+        pasos = 0
+        while cola and pasos < 10000:
+            pasos += 1
+            clave, prefijo, condicional = cola.popleft()
+            if prefijo in montaje[clave] and (montaje[clave][prefijo] or not condicional):
+                continue
+            montaje[clave][prefijo] = condicional
+            for destino, propio, condicional_hijo in por_host.get(clave, ()):
+                cola.append((destino, _une(prefijo, propio), condicional or condicional_hijo))
+        return montaje
+
+
+def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Superficie:
     arboles, sin_medir, ajenos = [], [], []
     for ruta in sorted(pathlib.Path(p) for p in rutas):
         fuente = ruta.read_text(encoding="utf-8", errors="replace")
@@ -272,13 +517,17 @@ def superficie_servidor(rutas: list, prefijo_base: str = "") -> Superficie:
     nombres = _nombres_modelos([a for _, a in arboles])
     modelos = _modelos([a for _, a in arboles], nombres)
 
-    operaciones = []
+    if raiz is None:
+        raiz = pathlib.Path(os.path.commonpath([str(r.parent) for r, _ in arboles])) if arboles else pathlib.Path(".")
+    indice = _Indice(arboles, pathlib.Path(raiz))
+    aristas, condicionales = indice.aristas(ajenos)
+    montaje = indice.montajes(aristas)
+    if not prefijo_base:
+        sin_medir.extend(ajenos)
+
+    operaciones, vistas = [], {}
     for ruta, arbol in arboles:
-        prefijos = _prefijos_de_router(arbol)
-        notas = _prefijos_no_medidos(arbol, ruta)
-        ajenos.extend(notas)
-        if not prefijo_base:
-            sin_medir.extend(notas)
+        modulo = _modulo_de(ruta, pathlib.Path(raiz))
         for nodo in ast.walk(arbol):
             if not isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -292,22 +541,27 @@ def superficie_servidor(rutas: list, prefijo_base: str = "") -> Superficie:
                 if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
                     camino = dec.args[0].value
                 codigos, respuesta = _kwargs_decorador(dec, modelos)
+                if not respuesta:
+                    respuesta = _anotacion_de_retorno(nodo, modelos)
                 peticion = ()
-                argumentos = nodo.args.args
-                if argumentos and argumentos[0].arg in ("self", "cls"):
-                    argumentos = argumentos[1:]
-                for arg in argumentos:
-                    if arg.annotation is None:
-                        continue
+                for arg in _parametros(nodo):
                     nombre_modelo = _modelo_de(ast.unparse(arg.annotation), modelos)
                     if nombre_modelo:
                         peticion = modelos[nombre_modelo]
                 if camino is None:
                     sin_medir.append(f"{ruta}:{nodo.lineno} ruta no literal en {metodo}")
                     continue
-                prefijo = prefijos.get(ast.unparse(dec.func.value), "")
-                camino = _une(prefijo_base, _une(prefijo, camino))
-                operaciones.append(Operacion(metodo, camino, peticion, respuesta, codigos, f"{ruta}:{nodo.lineno}"))
+                nombre_router = ast.unparse(dec.func.value)
+                propio = indice.prefijos.get((modulo, nombre_router), "")
+                for prefijo, condicional in sorted((montaje.get((modulo, nombre_router)) or {"": False}).items()):
+                    completa = _une(prefijo_base, _une(_une(prefijo, propio), camino))
+                    if (metodo, completa) in vistas:
+                        if not condicional:
+                            vistas[(metodo, completa)] = False
+                        continue
+                    vistas[(metodo, completa)] = condicional
+                    operaciones.append(Operacion(metodo, completa, peticion, respuesta, codigos,
+                                                 f"{ruta}:{nodo.lineno}", condicional))
 
     con_campos = sum(1 for op in operaciones if op.peticion or op.respuesta)
     marco = {
@@ -318,6 +572,7 @@ def superficie_servidor(rutas: list, prefijo_base: str = "") -> Superficie:
         "rutas_sin_campos": len(operaciones) - con_campos,
         "prefijos_no_medidos": len(ajenos),
         "prefijo_base": prefijo_base or "NO_DECLARADO",
+        "inclusiones_condicionales": condicionales,
         "sin_lector": ["typescript", "yaml"],
     }
     return Superficie("servidor", tuple(operaciones), len(arboles), len(modelos), tuple(sin_medir), marco)
@@ -453,7 +708,7 @@ def _divergencias(campos_codigo: tuple, campos_spec: tuple, metodo: str, ruta: s
         if codigo[nombre].tipo != spec[nombre].tipo:
             salida.append(Hallazgo("TIPO_DIVERGENTE", metodo, ruta,
                                    f"{lado} '{nombre}': servidor={codigo[nombre].tipo} · contrato={spec[nombre].tipo}", "ROJO"))
-        if codigo[nombre].requerido != spec[nombre].requerido:
+        if lado != "respuesta" and codigo[nombre].requerido != spec[nombre].requerido:
             salida.append(Hallazgo("REQUERIDO_DIVERGENTE", metodo, ruta,
                                    f"{lado} '{nombre}': servidor={'requerido' if codigo[nombre].requerido else 'opcional'}"
                                    f" · contrato={'requerido' if spec[nombre].requerido else 'opcional'}", "ROJO"))
@@ -470,8 +725,12 @@ def comparar(codigo: Superficie, spec: Superficie) -> list:
     for clave in sorted(indice_codigo, key=lambda k: (k[1], k[0])):
         if clave not in indice_spec:
             op = indice_codigo[clave]
-            hallazgos.append(Hallazgo("FALTA_EN_SPEC", op.metodo, op.ruta,
-                                      f"el servidor la declara en {op.fuente}", "ROJO"))
+            if op.condicional:
+                hallazgos.append(Hallazgo("CONDICIONAL_NO_PUBLICADA", op.metodo, op.ruta,
+                                          f"el servidor la monta bajo una condicion que no se evaluo; ver {op.fuente}", "WARN"))
+            else:
+                hallazgos.append(Hallazgo("FALTA_EN_SPEC", op.metodo, op.ruta,
+                                          f"el servidor la declara en {op.fuente}", "ROJO"))
     for clave in sorted(indice_spec, key=lambda k: (k[1], k[0])):
         if clave not in indice_codigo:
             hallazgos.append(Hallazgo("FALTA_EN_CODIGO", clave[0], clave[1],

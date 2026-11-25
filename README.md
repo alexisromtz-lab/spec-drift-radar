@@ -13,7 +13,7 @@ $ spec-drift-radar --servidor api/ --openapi openapi.json
 spec-drift-radar · la superficie del servidor contra el contrato que publica
 
 MARCO DEL SERVIDOR   archivos_py=1 · modelos=3 · rutas_codigo=2 · sin_lector=typescript,yaml
-CAMPOS LEIDOS         rutas_con_campos=2 · rutas_sin_campos=0 · prefijos_no_medidos=0 · prefijo_base=NO_DECLARADO
+CAMPOS LEIDOS         rutas_con_campos=2 · rutas_sin_campos=0 · prefijos_no_medidos=0 · inclusiones_condicionales=0 · prefijo_base=NO_DECLARADO
 MARCO DEL CONTRATO   openapi=3.1.0 · titulo=Pedidos · version=2026-11 · rutas_spec=3
 
 HALLAZGOS  rojos=6 · avisos=1 · pares_comparados=2
@@ -54,7 +54,7 @@ $ spec-drift-radar --servidor api/ --openapi openapi.json --json
 # 3. derivar el contrato desde el servidor y escribirlo (arranque de una API sin spec)
 $ spec-drift-radar --servidor api/ --emitir openapi.json
 
-# 4. declarar el prefijo de montaje que el codigo no resuelve (`settings.API_V1_STR`)
+# 4. anteponer un prefijo de montaje que el codigo no resuelve (caso raro, ver «Prefijos»)
 $ spec-drift-radar --servidor api/ --prefijo /api/v1 --emitir openapi.json
 
 # 5. verificar el instrumento consigo mismo (emite, compara, muta y detecta)
@@ -94,12 +94,20 @@ sólo se emite cuando las dos superficies existen.
   parser. Se publica como `sin_lector`, nunca como «cero hallazgos».
 - Rutas construidas en tiempo de ejecución (`f"{PREFIJO}/x"`): se anotan en `sin_medir` y
   fuerzan RC 2.
+- Condiciones de arranque (`if settings.ENV == "development": app.include_router(...)`): el AST
+  no evalúa la condición, así que la ruta se publica con `CONDICIONAL_NO_PUBLICADA` y el número
+  de inclusiones condicionales viaja en `inclusiones_condicionales`. No es deriva: es un estado
+  del servidor que este instrumento no puede decidir.
 - Frameworks cuyo enrutado no vive en un decorador con ruta literal.
 
 **Prefijos.** El prefijo estático de un router se compone (`APIRouter(prefix="/usuarios")` +
-`@router.get("/{id}")` ⇒ `/usuarios/{id}`). Un `include_router(prefix=settings.ALGO)` con
-prefijo **no literal** no se adivina: se publica en `prefijos_no_medidos` y obliga a declarar
-`--prefijo /api/v1`. Con `--prefijo` la herramienta deja de bloquear y antepone ese valor.
+`@router.get("/{id}")` ⇒ `/usuarios/{id}`). Un `include_router(..., prefix=settings.API_V1_STR)`
+se resuelve **sin ejecutar el código**: la herramienta indexa los módulos del árbol, sigue los
+`import` entre ellos, propaga constantes (`API_V1_STR = "/api/v1"`, atributos de clase y literales
+de módulo) y monta el grafo de `include_router` desde los routers que nadie incluye. Los prefijos
+así resueltos se publican en `prefijos_no_medidos=0`; si alguno no se puede resolver, no se
+adivina: cuenta en `prefijos_no_medidos` y obliga a declarar `--prefijo`, que **antepone** ese
+valor en vez de impedir la corrida.
 
 ## Clases de hallazgo
 
@@ -112,34 +120,53 @@ prefijo **no literal** no se adivina: se publica en `prefijos_no_medidos` y obli
 | `TIPO_DIVERGENTE` | ROJO | mismo campo, distinto tipo (`integer` vs `string`) |
 | `REQUERIDO_DIVERGENTE` | ROJO | mismo campo, distinto `required` |
 | `CODIGO_DIVERGENTE` | WARN | distinto código de éxito (`201` vs `200`); no fuerza RC 1 |
+| `CONDICIONAL_NO_PUBLICADA` | WARN | el servidor monta la ruta dentro de un `if`/`try` que el AST no evalúa; no fuerza RC 1 |
 
 ## Estado medido
 
-- `v0.1.0` · 30 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.3.0` · 37 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
   coinciden campo por campo ⇒ **RC 0**. Esa corrida encontró cuatro defectos del lector que hoy
   son tests (`TestContraElGeneradorDeFastAPI`): `status_code` por atributo, `anyOf` con `null`,
   los códigos 4xx que el generador añade solo, y hallazgos sin decir de qué lado venían.
-- **Corrida sobre código externo real**
+- **Comparación contra el contrato real de un proyecto externo**
   ([`fastapi/full-stack-fastapi-template`](https://github.com/fastapi/full-stack-fastapi-template)
-  @ `77e550a`, 16-Nov-2026): 24 archivos ⇒ 23 operaciones en 15 rutas distintas, 21 modelos,
-  16 operaciones con campos y 7 sin cuerpo ni modelo de respuesta (declarado, no escondido).
-  RC 2, y la causa es del upstream: `backend/app/api/deps.py:36` no compila
-  (`except InvalidTokenError, ValidationError:` es sintaxis de Python 2). El lector lo publica
-  como `no parsea` en vez de saltárselo en silencio.
-- **Todavía no se ha medido la comparación contra el contrato de un proyecto externo**: hace
-  falta un repositorio que publique su `openapi.json` junto al código. Cuando exista la corrida,
-  la cifra y el commit van aquí.
+  @ `77e550a`, 16-Nov-2026): se importó la app real y se volcó su `app.openapi()` — el oráculo de
+  verdad: **14 rutas / 22 operaciones**. El radar, sobre los mismos 25 archivos, publicó 21 modelos
+  y 23 rutas de código, resolvió el prefijo `/api/v1` **sin `--prefijo`** (`prefijos_no_medidos=0`)
+  y comparó **22 pares** con **0 rojos y 1 aviso** declarado (`CONDICIONAL_NO_PUBLICADA` en
+  `/api/v1/private/users/`, que el template sólo monta si `FASTAPI_ENV == "development"`) ⇒ **RC 0**.
+  La corrida inicial daba **48 rojos** y todos eran defectos de este lector; hoy son tests:
+  la barra final de una ruta, los parámetros *keyword-only* (`def f(*, session, user_in)`), un
+  `Field(min_length=1)` que no es un valor por defecto, `EmailStr` como `string`, `required` en la
+  respuesta (donde no es contrato de cliente), el modelo de respuesta declarado sólo en la
+  anotación de retorno, y las inclusiones condicionales.
+- **Dos defectos del upstream**, medidos y no corregidos aquí: `backend/app/api/deps.py:36` no
+  compila (`except InvalidTokenError, ValidationError:` es sintaxis de Python 2) y
+  `backend/app/models.py:55` anota `list[Item]` antes de definir `Item` sin
+  `from __future__ import annotations` ⇒ `NameError` al importar. Contra el clon intacto este
+  radar publica **RC 2** (`no parsea`) en lugar de saltarse el archivo en silencio.
 
-Reproducir la corrida externa:
+Reproducir la corrida externa (incluye el parche mínimo para poder importar la app):
 
 ```console
 $ git clone --depth 1 https://github.com/fastapi/full-stack-fastapi-template.git /tmp/tpl
 $ git -C /tmp/tpl rev-parse HEAD   # 77e550a73bb49dd2967622c5ed11bf7a49603c93
-$ spec-drift-radar --servidor /tmp/tpl/backend/app --prefijo /api/v1 --emitir /tmp/tpl.json
-# contrato emitido · rutas=23 · archivos=24   (RC 2: deps.py:36 no parsea, defecto del upstream)
+$ cp -r /tmp/tpl/backend /tmp/tpl_oraculo
+$ # 1) parche de sintaxis en /tmp/tpl_oraculo/app/api/deps.py:36
+$ # 2) from __future__ import annotations en /tmp/tpl_oraculo/app/models.py
+$ # 3) mkdir /tmp/tpl_oraculo/app/frontend   (lo exige FastAPI.frontend())
+$ python3.12 -m venv /tmp/venv_tpl2 && /tmp/venv_tpl2/bin/pip install \
+    fastapi[standard] sqlmodel pydantic-settings sentry-sdk pyjwt pwdlib[argon2,bcrypt] \
+    psycopg[binary] emails jinja2
+$ (cd /tmp/tpl_oraculo && SECRET_KEY=x PROJECT_NAME=x FIRST_SUPERUSER=a@b.c \
+    FIRST_SUPERUSER_PASSWORD=x DATABASE_URL=postgresql://x/x \
+    /tmp/venv_tpl2/bin/python -c 'import json;from app.main import app;print(json.dumps(app.openapi()))' \
+    > /tmp/tpl_verdadero.json)
+$ spec-drift-radar --servidor /tmp/tpl_oraculo/app --openapi /tmp/tpl_verdadero.json
+# RC 0 · archivos_py=25 · modelos=21 · pares_comparados=22 · rojos=0 · avisos=1
 ```
 
 ## Familia

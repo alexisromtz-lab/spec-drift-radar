@@ -179,7 +179,7 @@ class TestPrefijosYModelos:
         assert [op.ruta for op in servidor.operaciones] == ["/api/v1/salud"]
         assert servidor.marco["prefijo_base"] == "/api/v1"
 
-    def test_include_router_con_prefijo_no_literal_es_no_medido(self, tmp_path):
+    def test_include_router_con_prefijo_no_resoluble_es_no_medido(self, tmp_path):
         (tmp_path / "app.py").write_text(
             'from fastapi import FastAPI\napp = FastAPI()\n'
             'app.include_router(otro, prefix=AJUSTES.API)\n',
@@ -187,7 +187,7 @@ class TestPrefijosYModelos:
         )
         servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
         assert servidor.marco["prefijos_no_medidos"] == 1
-        assert any("prefijo no literal" in nota for nota in servidor.sin_medir)
+        assert any("prefijo no resoluble" in nota for nota in servidor.sin_medir)
 
     def test_prefijo_base_silencia_el_hueco_declarado(self, tmp_path):
         (tmp_path / "app.py").write_text(
@@ -328,3 +328,109 @@ class TestCli:
         with pytest.raises(SystemExit) as exc:
             main([])
         assert exc.value.code == 2
+
+
+class TestContraUnProyectoReal:
+    """La segunda corrida contra un proyecto externo (`full-stack-fastapi-template`).
+
+    Cada caso de abajo es un defecto que el oraculo real encontro y que aqui queda
+    como contrato: sin el, la herramienta publicaba 48 hallazgos falsos sobre un
+    proyecto sano.
+    """
+
+    def test_la_barra_final_no_se_pierde(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\n\nrouter = APIRouter(prefix="/items")\n\n'
+            '@router.get("/")\ndef listar():\n    return []\n\n'
+            '@router.get("/{id}")\ndef uno(id: int):\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert sorted(op.ruta for op in servidor.operaciones) == ["/items/", "/items/{id}"]
+
+    def test_el_cuerpo_puede_venir_en_un_parametro_keyword_only(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel\n\nrouter = APIRouter()\n\n'
+            'class Usuario(BaseModel):\n    email: str\n\n'
+            '@router.patch("/usuarios/{id}")\ndef editar(*, id: int, usuario: Usuario):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [c.nombre for c in op.peticion] == ["email"]
+
+    def test_field_sin_default_es_requerido(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom sqlmodel import SQLModel, Field\n\nrouter = APIRouter()\n\n'
+            'class Item(SQLModel):\n'
+            '    titulo: str = Field(min_length=1, max_length=255)\n'
+            '    nota: str | None = Field(default=None, max_length=255)\n'
+            '    orden: int = Field(default_factory=int)\n\n'
+            '@router.post("/items")\ndef crear(item: Item):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        requeridos = {c.nombre for c in op.peticion if c.requerido}
+        assert requeridos == {"titulo"}
+
+    def test_la_respuesta_la_declara_la_anotacion_de_retorno(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel\n\nrouter = APIRouter()\n\n'
+            'class Token(BaseModel):\n    acceso: str\n    tipo: str\n\n'
+            '@router.post("/login")\ndef login() -> Token:\n    return Token(acceso="a", tipo="bearer")\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [c.nombre for c in op.respuesta] == ["acceso", "tipo"]
+
+    def test_emailstr_es_una_cadena(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel, EmailStr\n\nrouter = APIRouter()\n\n'
+            'class Usuario(BaseModel):\n    email: EmailStr\n\n'
+            '@router.post("/usuarios")\ndef crear(usuario: Usuario):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo) for c in op.peticion] == [("email", "string")]
+
+    def test_el_prefijo_se_resuelve_cruzando_modulos(self, tmp_path):
+        (tmp_path / "config.py").write_text(
+            'from pydantic_settings import BaseSettings\n\nclass Settings(BaseSettings):\n'
+            '    API: str = "/api/v1"\n\nsettings = Settings()\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "rutas.py").write_text(
+            'from fastapi import APIRouter\n\nrouter = APIRouter(prefix="/usuarios")\n\n'
+            '@router.get("/")\ndef listar():\n    return []\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "raiz.py").write_text(
+            'from fastapi import FastAPI\n\n'
+            'from config import settings\nfrom rutas import router\n\n'
+            'app = FastAPI()\napp.include_router(router, prefix=settings.API)\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert [op.ruta for op in servidor.operaciones] == ["/api/v1/usuarios/"]
+        assert servidor.marco["prefijos_no_medidos"] == 0
+
+    def test_un_include_router_condicional_no_es_un_rojo(self, tmp_path):
+        (tmp_path / "condicional.py").write_text(
+            'from fastapi import APIRouter\n\nrouter = APIRouter(prefix="/privado")\n\n'
+            '@router.post("/usuarios")\ndef crear():\n    return {}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\n\nfrom condicional import router as privado\n\n'
+            'API = "development"\nrouter = APIRouter()\n\n'
+            '@router.get("/salud")\ndef salud():\n    return {}\n\n'
+            'if API == "development":\n    router.include_router(privado)\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert servidor.marco["inclusiones_condicionales"] == 1
+        documento = emitir_openapi(servidor)
+        documento["paths"].pop("/privado/usuarios")
+        _servidor, _spec, hallazgos, rc = _medir(tmp_path, documento)
+        assert [h.clase for h in hallazgos] == ["CONDICIONAL_NO_PUBLICADA"]
+        assert hallazgos[0].severidad == "WARN"
+        assert rc == 0
