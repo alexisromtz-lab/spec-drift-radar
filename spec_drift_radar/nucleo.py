@@ -60,6 +60,7 @@ class Campo:
     nombre: str
     tipo: str
     requerido: bool
+    alias_no_medido: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,16 @@ def _nombres_modelos(arboles) -> set:
     return nombres
 
 
+def _requerido_en_llamada(valor) -> bool:
+    """`Field(...)` es requerido en pydantic v1 y `Field(None)` no; `Field(min_length=1)` tampoco da default."""
+    if not isinstance(valor, ast.Call):
+        return isinstance(valor, ast.Constant) and valor.value is Ellipsis
+    if valor.args:
+        primero = valor.args[0]
+        return isinstance(primero, ast.Constant) and primero.value is Ellipsis
+    return not any(kw.arg in ("default", "default_factory") for kw in valor.keywords)
+
+
 def _tiene_valor_por_defecto(valor) -> bool:
     """`title: str = Field(min_length=1)` no tiene default: `Field()` no es un valor, es configuracion.
 
@@ -153,22 +164,60 @@ def _tiene_valor_por_defecto(valor) -> bool:
     if not isinstance(valor, ast.Call):
         return True
     nombre = ast.unparse(valor.func).split(".")[-1]
-    if nombre not in ("Field", "Column"):
+    if nombre not in ("Field", "Column", "Body", "Form", "File"):
         return True
-    if valor.args:
-        return True
-    return any(kw.arg in ("default", "default_factory") for kw in valor.keywords)
+    return not _requerido_en_llamada(valor)
 
 
-def _campos_propios(clase: ast.ClassDef, modelos) -> list:
+def _alias_literal(valor) -> str | None:
+    """`Field(..., alias="tagList")` publica `tagList`: el nombre esta en el codigo y se puede leer."""
+    if not isinstance(valor, ast.Call):
+        return None
+    for kw in valor.keywords:
+        if kw.arg == "alias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            return kw.value.value
+    return None
+
+
+def _campos_propios(clase: ast.ClassDef, modelos, con_generador: bool = False) -> list:
     campos = []
     for item in clase.body:
         if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
             continue
         tipo, opcional = _tipo_py(ast.unparse(item.annotation), modelos)
         requerido = not (opcional or (item.value is not None and _tiene_valor_por_defecto(item.value)))
-        campos.append(Campo(item.target.id, tipo, requerido))
+        alias = _alias_literal(item.value)
+        # Sin alias literal, un `alias_generator` de la clase (o de un padre) renombra el campo
+        # con un valor que no esta en el AST: el nombre documentado es NO_MEDIDO, no una deriva.
+        campos.append(Campo(alias or item.target.id, tipo, requerido, alias is None and con_generador))
     return campos
+
+
+def _con_alias_generador(arboles, nombres) -> set:
+    """Modelos cuyo `Config.alias_generator` renombra los campos sin decir como."""
+    directos, padres = set(), {}
+    for arbol in arboles:
+        for nodo in ast.walk(arbol):
+            if not isinstance(nodo, ast.ClassDef):
+                continue
+            padres[nodo.name] = [ast.unparse(b).split(".")[-1] for b in nodo.bases]
+            for hijo in nodo.body:
+                if not isinstance(hijo, ast.ClassDef):
+                    continue
+                for linea in hijo.body:
+                    objetivo = getattr(linea, "target", None)
+                    if isinstance(linea, ast.Assign):
+                        objetivo = linea.targets[0] if linea.targets else None
+                    if isinstance(objetivo, ast.Name) and objetivo.id == "alias_generator":
+                        directos.add(nodo.name)
+    heredan = set(directos)
+    for _ in range(8):
+        nuevos = {nombre for nombre, bases in padres.items()
+                  if nombre in nombres and set(bases) & heredan} - heredan
+        if not nuevos:
+            break
+        heredan |= nuevos
+    return heredan & nombres
 
 
 def _modelos(arboles, nombres) -> dict:
@@ -184,6 +233,7 @@ def _modelos(arboles, nombres) -> dict:
                 clases[nodo.name] = nodo
                 padres[nodo.name] = [ast.unparse(b).split(".")[-1] for b in nodo.bases]
 
+    con_generador = _con_alias_generador(arboles, nombres)
     memo = {}
 
     def resolver(nombre, visto=()):
@@ -196,7 +246,7 @@ def _modelos(arboles, nombres) -> dict:
         for base in padres.get(nombre, ()):
             for campo in resolver(base, visto + (nombre,)):
                 acumulado[campo.nombre] = campo
-        for campo in _campos_propios(clase, nombres):
+        for campo in _campos_propios(clase, nombres, nombre in con_generador):
             acumulado[campo.nombre] = campo
         memo[nombre] = tuple(acumulado.values())
         return memo[nombre]
@@ -219,10 +269,11 @@ def _modelo_de(anotacion: str, modelos) -> str | None:
 
 
 def _codigo_de(nodo):
-    """`201`, `status.HTTP_201_CREATED` y `HTTPStatus.CREATED`: los tres son codigos."""
+    """`201`, `status.HTTP_201_CREATED`, `HTTP_201_CREATED` y `HTTPStatus.CREATED`: los cuatro son codigos."""
     if isinstance(nodo, ast.Constant) and isinstance(nodo.value, int):
         return nodo.value
-    if isinstance(nodo, ast.Attribute):
+    # Atributo o nombre suelto: `from starlette.status import HTTP_201_CREATED` deja un Name.
+    if isinstance(nodo, (ast.Attribute, ast.Name)):
         encontrado = re.search(r"HTTP_(\d{3})_", ast.unparse(nodo))
         if encontrado:
             return int(encontrado.group(1))
@@ -255,11 +306,58 @@ def _anotacion_de_retorno(nodo, modelos) -> tuple:
 
 
 def _parametros(nodo) -> list:
-    """Incluye los `*` keyword-only: `def f(*, user_in: UserUpdate)` no esta en args.args."""
-    argumentos = list(nodo.args.posonlyargs) + list(nodo.args.args) + list(nodo.args.kwonlyargs)
-    if argumentos and argumentos[0].arg in ("self", "cls"):
-        argumentos = argumentos[1:]
-    return [a for a in argumentos if a.annotation is not None]
+    """(argumento, valor por defecto): incluye los `*` keyword-only, que no estan en args.args."""
+    posicionales = list(nodo.args.posonlyargs) + list(nodo.args.args)
+    defectos = list(nodo.args.defaults)
+    mapa = {}
+    if defectos:
+        for argumento, defecto in zip(posicionales[len(posicionales) - len(defectos):], defectos):
+            mapa[id(argumento)] = defecto
+    pares = [(argumento, mapa.get(id(argumento))) for argumento in posicionales]
+    pares += list(zip(nodo.args.kwonlyargs, nodo.args.kw_defaults))
+    if pares and pares[0][0].arg in ("self", "cls"):
+        pares = pares[1:]
+    return [(argumento, defecto) for argumento, defecto in pares if argumento.annotation is not None]
+
+
+NO_VIAJAN_EN_EL_CUERPO = {
+    "Depends", "Security", "Query", "Path", "Header", "Cookie", "Request", "Response",
+    "WebSocket", "BackgroundTasks",
+}
+
+
+def _llamada(valor) -> str | None:
+    return ast.unparse(valor.func).split(".")[-1] if isinstance(valor, ast.Call) else None
+
+
+def _cuerpo_de_peticion(nodo, modelos) -> tuple:
+    """El cuerpo son los campos del modelo anotado, salvo que el parametro sea una dependencia.
+
+    `articles_repo: ArticlesRepository = Depends(get_repository(...))` no viaja en el cuerpo:
+    leerlo como cuerpo convertia cada `Depends` con modelo en 4 campos fantasma por operacion.
+    """
+    campos, embebido = (), None
+    for argumento, defecto in _parametros(nodo):
+        llamada = _llamada(defecto)
+        if llamada in NO_VIAJAN_EN_EL_CUERPO:
+            continue
+        nombre_modelo = _modelo_de(ast.unparse(argumento.annotation), modelos)
+        if llamada in ("Body", "Form", "File"):
+            alias, embed = None, False
+            for kw in defecto.keywords:
+                if kw.arg == "alias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    alias = kw.value.value
+                if kw.arg == "embed" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                    embed = True
+            if embed:
+                embebido = Campo(alias or argumento.arg, "object", _requerido_en_llamada(defecto))
+                continue
+            if nombre_modelo:
+                campos += modelos[nombre_modelo]
+            continue
+        if nombre_modelo:
+            campos += modelos[nombre_modelo]
+    return (embebido,) if embebido else campos
 
 
 def _prefijos_de_router(arbol) -> dict:
@@ -483,8 +581,10 @@ class _Indice:
         se marca condicional y todas sus rutas heredan la marca.
         """
         destinos = {destino for _, destino, _, _, _ in aristas}
-        semillas = [((modulo, nombre), "", False)
-                    for modulo, nombre in self.prefijos if (modulo, nombre) not in destinos]
+        # Una raiz es todo nodo que nadie monta: un router suelto pero tambien el objeto
+        # `FastAPI()` del arranque, que no es un router y por tanto no esta en `prefijos`.
+        nodos = set(self.prefijos) | {host for host, _, _, _, _ in aristas if host is not None} | destinos
+        semillas = [(nodo, "", False) for nodo in sorted(nodos) if nodo not in destinos]
         por_host = collections.defaultdict(list)
         for host, destino, prefijo, _, condicional in aristas:
             if host is None:
@@ -543,11 +643,7 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
                 codigos, respuesta = _kwargs_decorador(dec, modelos)
                 if not respuesta:
                     respuesta = _anotacion_de_retorno(nodo, modelos)
-                peticion = ()
-                for arg in _parametros(nodo):
-                    nombre_modelo = _modelo_de(ast.unparse(arg.annotation), modelos)
-                    if nombre_modelo:
-                        peticion = modelos[nombre_modelo]
+                peticion = _cuerpo_de_peticion(nodo, modelos)
                 if camino is None:
                     sin_medir.append(f"{ruta}:{nodo.lineno} ruta no literal en {metodo}")
                     continue
@@ -700,10 +796,18 @@ def _divergencias(campos_codigo: tuple, campos_spec: tuple, metodo: str, ruta: s
     salida = []
     codigo = {c.nombre: c for c in campos_codigo}
     spec = {c.nombre: c for c in campos_spec}
+    # Un `alias_generator` renombra campos con un valor que no esta en el AST: un nombre que
+    # solo aparece en un lado no es deriva, es un nombre que este lector no puede calcular.
+    con_generador = [c for c in campos_codigo if c.alias_no_medido]
     for nombre in sorted(codigo):
         if nombre not in spec:
-            salida.append(Hallazgo("CAMPO_FALTA_EN_SPEC", metodo, ruta,
-                                   f"{lado} '{nombre}': el servidor lo declara; el contrato no", "ROJO"))
+            if con_generador:
+                salida.append(Hallazgo("ALIAS_NO_MEDIDO", metodo, ruta,
+                                       f"{lado} '{nombre}': el modelo declara `alias_generator`,"
+                                       " el nombre publicado no se puede calcular desde el AST", "WARN"))
+            else:
+                salida.append(Hallazgo("CAMPO_FALTA_EN_SPEC", metodo, ruta,
+                                       f"{lado} '{nombre}': el servidor lo declara; el contrato no", "ROJO"))
             continue
         if codigo[nombre].tipo != spec[nombre].tipo:
             salida.append(Hallazgo("TIPO_DIVERGENTE", metodo, ruta,
@@ -714,8 +818,13 @@ def _divergencias(campos_codigo: tuple, campos_spec: tuple, metodo: str, ruta: s
                                    f" · contrato={'requerido' if spec[nombre].requerido else 'opcional'}", "ROJO"))
     for nombre in sorted(spec):
         if nombre not in codigo:
-            salida.append(Hallazgo("CAMPO_FALTA_EN_CODIGO", metodo, ruta,
-                                   f"{lado} '{nombre}': el contrato lo declara; el servidor no", "ROJO"))
+            if con_generador:
+                salida.append(Hallazgo("ALIAS_NO_MEDIDO", metodo, ruta,
+                                       f"{lado} '{nombre}': el contrato lo publica y el modelo lo renombra"
+                                       " con un `alias_generator` que no se puede calcular", "WARN"))
+            else:
+                salida.append(Hallazgo("CAMPO_FALTA_EN_CODIGO", metodo, ruta,
+                                       f"{lado} '{nombre}': el contrato lo declara; el servidor no", "ROJO"))
     return salida
 
 

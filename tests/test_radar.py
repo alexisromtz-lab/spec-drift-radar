@@ -434,3 +434,94 @@ class TestContraUnProyectoReal:
         assert [h.clase for h in hallazgos] == ["CONDICIONAL_NO_PUBLICADA"]
         assert hallazgos[0].severidad == "WARN"
         assert rc == 0
+
+
+class TestContraUnSegundoProyecto:
+    """La corrida contra `nsidnev/fastapi-realworld-example-app` (pydantic v1, `Depends` por todas partes).
+
+    Otro proyecto, otra familia, otros defectos: los cinco de abajo no los encontro el
+    primer oraculo porque el template oficial no usa inyeccion de dependencias ni
+    `alias_generator`.
+    """
+
+    def test_una_dependencia_no_es_un_cuerpo(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, Depends\nfrom pydantic import BaseModel\n\n'
+            'router = APIRouter()\n\n'
+            'class Usuario(BaseModel):\n    email: str\n    bio: str\n\n'
+            'def get_usuario() -> Usuario:\n    return Usuario(email="a@b.c", bio="")\n\n'
+            '@router.get("/perfil")\ndef perfil(usuario: Usuario = Depends(get_usuario)):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert op.peticion == ()
+
+    def test_body_embebido_publica_el_alias_de_la_llamada(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, Body\nfrom pydantic import BaseModel\n\n'
+            'router = APIRouter()\n\n'
+            'class ArticuloEntra(BaseModel):\n    titulo: str\n\n'
+            '@router.post("/articulos")\n'
+            'def crear(articulo: ArticuloEntra = Body(..., embed=True, alias="article")):\n'
+            '    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [(c.nombre, c.tipo, c.requerido) for c in op.peticion] == [("article", "object", True)]
+
+    def test_field_con_puntos_suspensivos_es_requerido(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel, Field\n\n'
+            'router = APIRouter()\n\n'
+            'class Usuario(BaseModel):\n'
+            '    email: str = Field(...)\n'
+            '    bio: str = Field("")\n\n'
+            '@router.post("/usuarios")\ndef crear(usuario: Usuario):\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert {c.nombre for c in op.peticion if c.requerido} == {"email"}
+
+    def test_un_alias_literal_es_el_nombre_documentado(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel, Field\n\n'
+            'router = APIRouter()\n\n'
+            'class Articulo(BaseModel):\n    tags: list[str] = Field([], alias="tagList")\n\n'
+            '@router.get("/articulos", response_model=Articulo)\ndef listar():\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert [c.nombre for c in op.respuesta] == ["tagList"]
+
+    def test_un_generador_de_alias_se_declara_no_se_adivina(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel\n\n'
+            'def a_camel(texto: str) -> str:\n    return texto\n\n'
+            'class Modelo(BaseModel):\n'
+            '    class Config:\n        alias_generator = a_camel\n\n'
+            'class Salida(Modelo):\n    total_del_dia: int\n\n'
+            'router = APIRouter()\n\n'
+            '@router.get("/resumen", response_model=Salida)\ndef resumen():\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        documento = emitir_openapi(servidor)
+        documento["paths"]["/resumen"]["get"]["responses"]["200"]["content"]["application/json"][
+            "schema"] = {"$ref": "#/components/schemas/Salida"}
+        documento["components"]["schemas"]["Salida"] = {
+            "type": "object", "properties": {"totalDelDia": {"type": "integer"}}, "required": ["totalDelDia"]
+        }
+        _servidor, _spec, hallazgos, rc = _medir(tmp_path, documento)
+        assert {h.clase for h in hallazgos} == {"ALIAS_NO_MEDIDO"}
+        assert all(h.severidad == "WARN" for h in hallazgos)
+        assert rc == 0
+
+    def test_el_codigo_de_estado_puede_ser_un_nombre_importado(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom starlette.status import HTTP_201_CREATED\n\n'
+            'router = APIRouter()\n\n'
+            '@router.post("/usuarios", status_code=HTTP_201_CREATED)\ndef crear():\n    return {}\n',
+            encoding="utf-8",
+        )
+        op = superficie_servidor(sorted(tmp_path.rglob("*.py"))).operaciones[0]
+        assert op.codigos == (201,)

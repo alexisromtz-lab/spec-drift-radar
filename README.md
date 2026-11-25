@@ -84,7 +84,11 @@ sólo se emite cuando las dos superficies existen.
 
 - Servidor: AST de Python. Routers estilo FastAPI (`@router.get/post/...` con ruta literal),
   modelos Pydantic por herencia declarada (`BaseModel`), `Optional[...]`, valores por defecto
-  y anotaciones `list[...]` / `dict[...]`.
+  (`Field(...)` requerido, `Field(None)` opcional, `Field(min_length=1)` sin default), `alias=`
+  literal, `Body(..., embed=True)` con su alias, y anotaciones `list[...]` / `dict[...]`.
+- Los parámetros que son **dependencias** (`= Depends(...)`, `= Query(...)`, `= Header(...)`) no
+  se leen como cuerpo: sin esa distinción, cada `Depends` con modelo anotado se publicaba como
+  cuatro o cinco campos fantasma por operación.
 - Contrato: OpenAPI 3.x en JSON. `paths`, `requestBody`, `responses` 2xx, `components.schemas`
   y `$ref` (con resolución acotada a 8 saltos para no colgarse en una referencia circular).
 
@@ -94,6 +98,9 @@ sólo se emite cuando las dos superficies existen.
   parser. Se publica como `sin_lector`, nunca como «cero hallazgos».
 - Rutas construidas en tiempo de ejecución (`f"{PREFIJO}/x"`): se anotan en `sin_medir` y
   fuerzan RC 2.
+- `alias_generator` en `Config`: renombra campos con un valor que no está en el AST (una función).
+  Los nombres afectados se publican como `ALIAS_NO_MEDIDO`, no como deriva. Un `alias="…"` literal
+  sí se compara.
 - Condiciones de arranque (`if settings.ENV == "development": app.include_router(...)`): el AST
   no evalúa la condición, así que la ruta se publica con `CONDICIONAL_NO_PUBLICADA` y el número
   de inclusiones condicionales viaja en `inclusiones_condicionales`. No es deriva: es un estado
@@ -121,10 +128,11 @@ valor en vez de impedir la corrida.
 | `REQUERIDO_DIVERGENTE` | ROJO | mismo campo, distinto `required` |
 | `CODIGO_DIVERGENTE` | WARN | distinto código de éxito (`201` vs `200`); no fuerza RC 1 |
 | `CONDICIONAL_NO_PUBLICADA` | WARN | el servidor monta la ruta dentro de un `if`/`try` que el AST no evalúa; no fuerza RC 1 |
+| `ALIAS_NO_MEDIDO` | WARN | el modelo declara `alias_generator`: el nombre publicado no se calcula desde el AST; no fuerza RC 1 |
 
 ## Estado medido
 
-- `v0.3.0` · 37 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.4.0` · 43 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
@@ -143,6 +151,16 @@ valor en vez de impedir la corrida.
   `Field(min_length=1)` que no es un valor por defecto, `EmailStr` como `string`, `required` en la
   respuesta (donde no es contrato de cliente), el modelo de respuesta declarado sólo en la
   anotación de retorno, y las inclusiones condicionales.
+- **Segundo oráculo, otra familia de proyecto**
+  ([`nsidnev/fastapi-realworld-example-app`](https://github.com/nsidnev/fastapi-realworld-example-app)
+  @ `029eb77`, 16-Nov-2026): 72 archivos, 32 modelos, **12 rutas / 19 operaciones** idénticas al
+  `app.openapi()` real, montaje resuelto a **cuatro niveles** (`main → api → articles.api → *`),
+  `prefijos_no_medidos=0`. La primera corrida dio **156 rojos**; hoy son **0 rojos y 4 avisos**
+  (`ALIAS_NO_MEDIDO`) ⇒ **RC 0**. Ese proyecto no usa nada del template oficial, y por eso encontró
+  cinco defectos que el primer oráculo no podía ver: `Depends(...)` leído como cuerpo,
+  `Body(..., embed=True, alias="article")` sin embeker, `Field(...)` (pydantic v1) leído como
+  opcional, `alias="tagList"` ignorado, `alias_generator` convertido en deriva y
+  `status_code=HTTP_201_CREATED` (nombre suelto) leído como 200.
 - **Dos defectos del upstream**, medidos y no corregidos aquí: `backend/app/api/deps.py:36` no
   compila (`except InvalidTokenError, ValidationError:` es sintaxis de Python 2) y
   `backend/app/models.py:55` anota `list[Item]` antes de definir `Item` sin
@@ -167,6 +185,16 @@ $ (cd /tmp/tpl_oraculo && SECRET_KEY=x PROJECT_NAME=x FIRST_SUPERUSER=a@b.c \
     > /tmp/tpl_verdadero.json)
 $ spec-drift-radar --servidor /tmp/tpl_oraculo/app --openapi /tmp/tpl_verdadero.json
 # RC 0 · archivos_py=25 · modelos=21 · pares_comparados=22 · rojos=0 · avisos=1
+
+$ git clone --depth 1 https://github.com/nsidnev/fastapi-realworld-example-app.git /tmp/rw
+$ git -C /tmp/rw rev-parse HEAD   # 029eb7781c60d5f563ee8990a0cbfb79b244538c
+$ python3.12 -m venv /tmp/venv_rw && /tmp/venv_rw/bin/pip install \
+    "fastapi==0.79.1" "pydantic[email]==1.10.18" "databases==0.6.2" "aiosql==6.4" "setuptools<70" \
+    "pyjwt==2.4.0" passlib bcrypt asyncpg pypika loguru "python-slugify==6.1.2" Unidecode ujson
+$ (cd /tmp/rw && DATABASE_URL=postgresql://u:p@localhost/db SECRET_KEY=x /tmp/venv_rw/bin/python -c \
+    'import json;from app.main import app;print(json.dumps(app.openapi()))' > /tmp/rw_verdadero.json)
+$ spec-drift-radar --servidor /tmp/rw/app --openapi /tmp/rw_verdadero.json
+# RC 0 · archivos_py=72 · modelos=32 · rutas_codigo=19 · rutas_spec=19 · rojos=0 · avisos=4
 ```
 
 ## Familia
