@@ -93,7 +93,10 @@ La asimetría es el veredicto, no un detalle: **perder** algo, o que algo pase a
 **obligatorio**, rompe clientes (`ROJO`); **añadir** algo opcional o una operación nueva no
 rompe nada (`WARN`, no fuerza RC 1). Un cambio de tipo cuenta como ruptura aunque pudiera ser un
 ensanche (`integer` → `number`), porque este lector no conoce la relación de subtipos y decir
-«compatible» sin poder medirlo sería un verde barato.
+«compatible» sin poder medirlo sería un verde barato. La excepción es el ensanche que el documento
+**enumera**: si el tipo es una unión (`anyOf`) y el conjunto de ramas crece, la rama vieja sigue
+ahí y el campo se publica como `TIPO_AMPLIADO` con severidad según el lado —`WARN` en petición,
+`ROJO` en respuesta, porque un lector tipado puede recibir una forma que no esperaba—.
 
 Se mide en **dos ejes**, y cada campo se publica **una sola vez**:
 
@@ -115,7 +118,9 @@ es el uso que rompe: es una suposición declarada, no una lectura.
 | `OPERACION_ANADIDA` | WARN | operación nueva; no rompe a ningún cliente existente |
 | `OPERACION_CONDICIONAL_ELIMINADA` | WARN | la anterior la marcaba `x-spec-drift-radar-condicional`: no consta que se publicara |
 | `CAMPO_ELIMINADO` | ROJO | el campo existía y ya no se publica |
-| `TIPO_CAMBIADO` | ROJO | mismo campo, distinto tipo |
+| `TIPO_CAMBIADO` | ROJO | mismo campo, y ni las ramas viejas están en las nuevas ni al revés |
+| `TIPO_ESTRECHADO` | ROJO / WARN | la unión perdió una rama: `ROJO` si es petición (el cliente ya no puede enviarla), `WARN` si es respuesta |
+| `TIPO_AMPLIADO` | WARN / ROJO | la unión ganó una rama: `WARN` si es petición, `ROJO` si es respuesta |
 | `REQUERIDO_ENDURECIDO` | ROJO | era opcional y ahora es obligatorio |
 | `REQUERIDO_RELAJADO` | WARN | era obligatorio y ahora es opcional |
 | `CAMPO_REQUERIDO_NUEVO` | ROJO | no existía y ahora es obligatorio |
@@ -220,7 +225,7 @@ valor en vez de impedir la corrida.
 
 ## Estado medido
 
-- `v0.6.0` · 80 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.6.1` · 85 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
@@ -365,6 +370,35 @@ $ spec-drift-radar --contrato-anterior k8s_v1.28.0.json --openapi k8s_v1.29.0.js
 # HALLAZGOS  rojos=35 · avisos=117 · operaciones_comparadas=831 · esquemas_comparados=544
 # RC 1 · ruptura medida: un cliente de la version anterior deja de funcionar
 ```
+
+- **Sexto oráculo, otro dialecto, otro vendedor y otra forma de romper: Stripe.** Dos versiones
+  publicadas del mismo contrato, `2026-08-26.dahlia` → `2026-09-30.endive`
+  (`openapi/spec3.json`, `openapi 3.0.0`, 8,0 y 8,3 MB): 594 y 612 operaciones, 1 454 y 1 538
+  modelos, **1 453 modelos comparados**, RC 1 con 12 rupturas en 0,6 s. Las doce se verificaron
+  una a una con un comprobador escrito aparte del motor, sin reutilizar su predicado: **12 / 12
+  confirmadas, 0 falsos positivos**. Y enseñan la asimetría del eje `lado`: Stripe retiró
+  `payment_method_types` de los **argumentos** de `POST /v1/payment_intents`,
+  `/v1/checkout/sessions`, `/v1/setup_intents` y tres rutas más —ruptura— mientras el modelo
+  `payment_intent` **sigue publicándolo** en la respuesta. Un campo que sale de lo que envías no
+  es un campo que sale de lo que recibes, y sólo lo primero rompe.
+
+```console
+$ git clone --filter=blob:none --no-checkout https://github.com/stripe/openapi
+$ git -C openapi show v2500:openapi/spec3.json > stripe_2500.json
+$ git -C openapi show v2602:openapi/spec3.json > stripe_v2602.json
+$ spec-drift-radar --contrato-anterior stripe_2500.json --openapi stripe_v2602.json
+# MARCO ANTERIOR   dialecto=openapi 3.0.0 · version=2026-08-26.dahlia · rutas_spec=594 · esquemas=1454
+# MARCO NUEVO      dialecto=openapi 3.0.0 · version=2026-09-30.endive · rutas_spec=612 · esquemas=1538
+# HALLAZGOS  rojos=12 · avisos=226 · operaciones_comparadas=594 · esquemas_comparados=1453
+```
+
+Ese oráculo encontró un defecto que ningún fixture propio iba a encontrar: **el tipo de un campo
+se leía de la primera rama de `anyOf`**. Un `mandate` que pasa de `string` a
+`anyOf: [string, Mandate]` es un ensanche y no rompe nada; el mismo documento con las dos ramas
+invertidas daba un rojo más (12 → 13) sin que cambiara el significado. El 11,7 % de las
+propiedades de un contrato real (790 de 6 759) son uniones, así que el veredicto no podía
+depender del orden de las claves. Hoy el tipo se publica como conjunto ordenado —`object|string`—
+y el veredicto es idéntico con las ramas en cualquier orden (`TestUnionDeTiposSinOrden`).
 
 ## Familia
 

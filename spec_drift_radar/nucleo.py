@@ -63,6 +63,7 @@ class Campo:
     tipo: str
     requerido: bool
     alias_no_medido: bool = False
+    tipos: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -878,6 +879,42 @@ def _resolver(schema: dict, componentes: dict) -> dict:
     return schema if isinstance(schema, dict) else {}
 
 
+def _tipos_de(definicion: dict, componentes: dict, profundidad: int = 0) -> frozenset:
+    """Conjunto de tipos que un schema admite, sin depender del orden de las ramas.
+
+    `anyOf` no es una lista ordenada por importancia: `[string, Mandate]` y `[Mandate, string]`
+    son el mismo contrato. Leerlo como "el primer tipo no nulo" hacía que la misma pareja de
+    documentos diera 12 rojos o 13 segun se reordenaran las ramas —medido sobre Stripe
+    `2026-08-26.dahlia` -> `2026-09-30.endive`—, asi que el tipo se publica como conjunto.
+    """
+    definicion = _resolver(definicion, componentes)
+    tipo = definicion.get("type")
+    if isinstance(tipo, str):
+        return frozenset({tipo})
+    if profundidad < 3:
+        for clave in ("anyOf", "oneOf", "allOf"):
+            ramas = definicion.get(clave)
+            if isinstance(ramas, list):
+                tipos = set()
+                for rama in ramas:
+                    tipos |= _tipos_de(rama, componentes, profundidad + 1)
+                tipos.discard("null")
+                if tipos:
+                    return frozenset(tipos)
+    if "properties" in definicion:
+        return frozenset({"object"})
+    if "items" in definicion:
+        return frozenset({"array"})
+    return frozenset({"any"})
+
+
+def _tipo_canonico(tipos: frozenset) -> str:
+    """Nombre estable de un conjunto de tipos: `string` o `object|string`, siempre ordenado."""
+    if not tipos:
+        return "any"
+    return "|".join(sorted(tipos))
+
+
 def _tipo_de(definicion: dict, componentes: dict, profundidad: int = 0) -> str:
     """Tipo normalizado de un schema.
 
@@ -952,10 +989,11 @@ def _propiedades_declaradas(schema: dict, componentes: dict, profundidad: int = 
 
 def _campos_schema(schema: dict, componentes: dict) -> tuple:
     propiedades, requeridos = _propiedades_declaradas(schema, componentes)
-    return tuple(
-        Campo(nombre, _tipo_de(definicion, componentes), nombre in requeridos)
-        for nombre, definicion in propiedades.items()
-    )
+    salida = []
+    for nombre, definicion in propiedades.items():
+        tipos = _tipos_de(definicion, componentes)
+        salida.append(Campo(nombre, _tipo_canonico(tipos), nombre in requeridos, tipos=tipos))
+    return tuple(salida)
 
 
 DIALECTOS = ("openapi", "swagger")
@@ -1175,9 +1213,23 @@ def _deriva_de_campos(viejos: tuple, nuevos: tuple, metodo: str, ruta: str, lado
                                    f"{lado} '{nombre}': la version anterior lo publicaba y esta no", "ROJO", campo=nombre))
             continue
         nuevo = nuevos_por_nombre[nombre]
-        if viejo.tipo != nuevo.tipo:
+        perdidos = (viejo.tipos or {viejo.tipo}) - (nuevo.tipos or {nuevo.tipo})
+        ganados = (nuevo.tipos or {nuevo.tipo}) - (viejo.tipos or {viejo.tipo})
+        if perdidos and ganados:
             salida.append(Hallazgo("TIPO_CAMBIADO", metodo, ruta,
                                    f"{lado} '{nombre}': anterior={viejo.tipo} · nuevo={nuevo.tipo}", "ROJO", campo=nombre))
+        elif perdidos and lado != "respuesta":
+            salida.append(Hallazgo("TIPO_ESTRECHADO", metodo, ruta,
+                                   f"{lado} '{nombre}': ya no admite {', '.join(sorted(perdidos))} · ahora={nuevo.tipo}", "ROJO", campo=nombre))
+        elif perdidos:
+            salida.append(Hallazgo("TIPO_ESTRECHADO", metodo, ruta,
+                                   f"{lado} '{nombre}': ya no publica {', '.join(sorted(perdidos))} · ahora={nuevo.tipo}", "WARN", campo=nombre))
+        elif ganados and lado == "respuesta":
+            salida.append(Hallazgo("TIPO_AMPLIADO", metodo, ruta,
+                                   f"{lado} '{nombre}': puede publicar {', '.join(sorted(ganados))} ademas de {viejo.tipo}", "ROJO", campo=nombre))
+        elif ganados:
+            salida.append(Hallazgo("TIPO_AMPLIADO", metodo, ruta,
+                                   f"{lado} '{nombre}': admite ademas {', '.join(sorted(ganados))} · ahora={nuevo.tipo}", "WARN", campo=nombre))
         if lado != "respuesta" and not viejo.requerido and nuevo.requerido:
             salida.append(Hallazgo("REQUERIDO_ENDURECIDO", metodo, ruta,
                                    f"{lado} '{nombre}': era opcional y ahora es obligatorio", "ROJO", campo=nombre))

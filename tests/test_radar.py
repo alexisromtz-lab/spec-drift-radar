@@ -771,7 +771,9 @@ class TestDerivaEntreContratos:
 
     El veredicto es asimetrico: perder algo o volverlo obligatorio rompe a un cliente
     que hoy funciona; anadir un campo opcional no. Un cambio de tipo cuenta como
-    ruptura aunque pudiera ser un ensanche, porque este lector no conoce los subtipos.
+    ruptura aunque pudiera ser un ensanche, porque este lector no conoce los subtipos;
+    la excepcion es la union que el documento enumera, que si se puede leer (clase
+    `TestUnionDeTiposSinOrden`).
     """
 
     def _medir(self, anterior, nuevo):
@@ -990,3 +992,64 @@ class TestDialectoYModelosNombrados:
         salida = json.loads(capsys.readouterr().out)
         assert salida["rc"] == 1
         assert {h["clase"] for h in salida["hallazgos"]} == {"CAMPO_ELIMINADO"}
+
+
+class TestUnionDeTiposSinOrden:
+    """`anyOf` no es una lista por importancia: `[string, Mandate]` y `[Mandate, string]` son
+    el mismo contrato.
+
+    Medido sobre Stripe `2026-08-26.dahlia` -> `2026-09-30.endive`: leer el tipo como "la
+    primera rama no nula" daba 12 rojos con un documento y 13 con el mismo documento de ramas
+    invertidas. El 11,7 % de las propiedades de un contrato real (790 de 6 759) son uniones,
+    asi que el orden no podia decidir el veredicto.
+    """
+
+    def _medir(self, anterior, nuevo):
+        viejo = superficie_openapi(anterior)
+        actual = superficie_openapi(nuevo)
+        return comparar_contratos(viejo, actual)
+
+    def _con_propiedad(self, propiedad, en_respuesta=False):
+        op = {"responses": {"200": _cuerpo("Item")}} if en_respuesta else {
+            "requestBody": _cuerpo("Item"), "responses": {"200": {"description": ""}}}
+        return _contrato({"/items": {"post": op}},
+                         {"Item": {"type": "object", "properties": {"mandato": propiedad}},
+                          "Mandato": {"type": "object", "properties": {"id": {"type": "string"}}}})
+
+    def test_el_orden_de_las_ramas_no_cambia_el_veredicto(self):
+        cadena = {"type": "string"}
+        referencia = {"$ref": "#/components/schemas/Mandato"}
+        directo = self._con_propiedad({"anyOf": [cadena, referencia]})
+        invertido = self._con_propiedad({"anyOf": [referencia, cadena]})
+        un_hallazgo = [(h.clase, h.severidad, h.detalle) for h in self._medir(directo, invertido)]
+        assert un_hallazgo == []
+        assert self._medir(invertido, directo) == []
+
+    def test_el_tipo_se_publica_como_conjunto_ordenado(self):
+        referencia = {"$ref": "#/components/schemas/Mandato"}
+        doc = self._con_propiedad({"anyOf": [referencia, {"type": "string"}]})
+        campo = superficie_openapi(doc).definiciones[0][1][0]
+        assert campo.tipo == "object|string"
+        assert campo.tipos == frozenset({"object", "string"})
+
+    def test_quitar_una_rama_que_la_peticion_admitia_rompe(self):
+        ancho = self._con_propiedad({"anyOf": [{"type": "string"},
+                                               {"$ref": "#/components/schemas/Mandato"}]})
+        estrecho = self._con_propiedad({"type": "string"})
+        assert [(h.clase, h.severidad) for h in self._medir(ancho, estrecho)] == [
+            ("TIPO_ESTRECHADO", "ROJO")]
+
+    def test_anadir_una_rama_a_la_peticion_avisa_y_no_rompe(self):
+        estrecho = self._con_propiedad({"type": "string"})
+        ancho = self._con_propiedad({"anyOf": [{"type": "string"},
+                                               {"$ref": "#/components/schemas/Mandato"}]})
+        hallazgos = self._medir(estrecho, ancho)
+        assert [(h.clase, h.severidad) for h in hallazgos] == [("TIPO_AMPLIADO", "WARN")]
+
+    def test_una_respuesta_que_empieza_a_publicar_otra_forma_rompe(self):
+        estrecho = self._con_propiedad({"type": "string"}, en_respuesta=True)
+        ancho = self._con_propiedad({"anyOf": [{"type": "string"},
+                                               {"$ref": "#/components/schemas/Mandato"}]},
+                                    en_respuesta=True)
+        hallazgos = self._medir(estrecho, ancho)
+        assert [(h.clase, h.severidad) for h in hallazgos] == [("TIPO_AMPLIADO", "ROJO")]
