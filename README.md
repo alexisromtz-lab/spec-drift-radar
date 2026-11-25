@@ -119,7 +119,7 @@ sólo se emite cuando las dos superficies existen.
   `Strict`): sus seis campos (`grant_type`, `username`, `password`, `scope`, `client_id`,
   `client_secret`) los genera `fastapi.security`, no el AST. Se publica
   `CUERPO_NO_MEDIDO_POR_DEPENDENCIA` y ese cuerpo **no se compara** — declarado, no adivinado.
-- Frameworks cuyo enrutado no vive en un decorador con ruta literal.
+- Frameworks cuyo enrutado no vive en un decorador con ruta literal (Flask, Django, Starlette puro): el marco declara `lector=fastapi`, y si el contrato publica operaciones que ese lector no encuentra, sale **un** aviso `SERVIDOR_NO_LEIDO` — no una `FALTA_EN_CODIGO` por ruta, que sería atribuir al servidor una ceguera del instrumento — y el veredicto es **RC 2**, nunca RC 0.
 
 **Prefijos.** El prefijo estático de un router se compone (`APIRouter(prefix="/usuarios")` +
 `@router.get("/{id}")` ⇒ `/usuarios/{id}`). Un `include_router(..., prefix=settings.API_V1_STR)`
@@ -144,10 +144,11 @@ valor en vez de impedir la corrida.
 | `CONDICIONAL_NO_PUBLICADA` | WARN | el servidor monta la ruta dentro de un `if`/`try` que el AST no evalúa; no fuerza RC 1 |
 | `ALIAS_NO_MEDIDO` | WARN | el modelo declara `alias_generator`: el nombre publicado no se calcula desde el AST; no fuerza RC 1 |
 | `CUERPO_NO_MEDIDO_POR_DEPENDENCIA` | WARN | el cuerpo viaja en un formulario de `fastapi.security`; sus campos no se calculan desde el AST y no se comparan |
+| `SERVIDOR_NO_LEIDO` | WARN | el lector de rutas (`lector=fastapi`) no encontró ninguna y el contrato publica varias: no hay nada que comparar ruta a ruta |
 
 ## Estado medido
 
-- `v0.5.0` · 55 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.5.1` · 58 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
@@ -247,6 +248,27 @@ $ #   copiarlo a /tmp/fa_apps/<dir>__<stem>/ y volcar app.openapi() a openapi.js
 $ #   (38 apps no se pueden importar: httpx2, uvicorn, orjson, static/ ausente)
 $ for d in /tmp/fa_apps/*/; do spec-drift-radar --servidor "$d" --openapi "$d/openapi.json" --json; done
 # 324 medidas · RC 0 = 321 · RC 1 = 0 · RC 2 = 3 (sin rutas publicadas)
+```
+
+- **Cuarto oráculo, un framework que este lector no reconoce**
+  ([`flask-smorest`](https://github.com/marshmallow-code/flask-smorest), 25-Nov-2026): la app de
+  ejemplo del propio proyecto, con su contrato generado por el framework (3 operaciones, cuerpo y
+  `query` reales). Un instrumento deshonesto contesta aquí una de dos cosas: «0 hallazgos, sin
+  deriva» (falso verde en la dirección peligrosa) o tres `FALTA_EN_CODIGO` (le atribuye al sujeto
+  lo que es ceguera del lector). Este contesta **un aviso `SERVIDOR_NO_LEIDO`, `rojos=0` y RC 2**,
+  y el marco publica `lector=fastapi` para que se vea de un golpe por qué no hay nada que
+  comparar. Es el resultado que se quería: el camino `NO_MEDIDO` no se degrada a 0 cuando el
+  servidor existe y el lector no lo entiende.
+
+```console
+$ python3.12 -m venv /tmp/venv_flask && /tmp/venv_flask/bin/pip install flask flask-smorest
+$ # app de ejemplo de flask-smorest (blueprint /items con GET, POST y GET /<int:item_id>)
+$ /tmp/venv_flask/bin/python -c "from app import app; import json; \
+    json.dump(app.test_client().get('/openapi.json').get_json(), open('/tmp/flask_verdadero.json','w'))"
+$ spec-drift-radar --servidor /tmp/app_flask --openapi /tmp/flask_verdadero.json
+# MARCO DEL SERVIDOR ... rutas_codigo=0 · lector=fastapi
+# HALLAZGOS  rojos=0 · avisos=1   [WARN] SERVIDOR_NO_LEIDO
+# RC 2 · NO_MEDIDO: un cero aquí no es un cero, es una ausencia de lectura
 ```
 
 ## Familia

@@ -31,7 +31,8 @@ def _archivos_py(directorio: pathlib.Path) -> list:
 def _texto(codigo, spec, hallazgos, rc) -> str:
     lineas = [CABECERA, ""]
     lineas.append(f"MARCO DEL SERVIDOR   archivos_py={codigo.marco['archivos_py']} · modelos={codigo.marco['modelos']}"
-                  f" · rutas_codigo={codigo.marco['rutas_codigo']} · sin_lector={','.join(codigo.marco['sin_lector'])}")
+                  f" · rutas_codigo={codigo.marco['rutas_codigo']} · lector={codigo.marco['lector']}"
+                  f" · sin_lector={','.join(codigo.marco['sin_lector'])}")
     lineas.append(f"CAMPOS LEIDOS         rutas_con_campos={codigo.marco['rutas_con_campos']}"
                   f" · rutas_sin_campos={codigo.marco['rutas_sin_campos']}"
                   f" · prefijos_no_medidos={codigo.marco['prefijos_no_medidos']}"

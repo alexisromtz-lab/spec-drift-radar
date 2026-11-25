@@ -99,6 +99,11 @@ class Hallazgo:
 
 # --- lector 1: AST del servidor ---------------------------------------------
 
+#: Forma de servidor que este lector reconoce. Se publica en el marco porque una
+#: superficie vacia no distingue "el servidor no declara rutas" de "aqui no hay
+#: FastAPI", y esas dos cosas no se contestan igual.
+LECTOR = "fastapi"
+
 
 GENERICOS_DE_UN_SOLO_ARG = ("Optional[", "list[", "List[", "Sequence[", "set[", "Set[", "tuple[", "Tuple[")
 
@@ -845,6 +850,7 @@ def superficie_servidor(rutas: list, prefijo_base: str = "", raiz=None) -> Super
         "inclusiones_condicionales": condicionales,
         "cuerpos_declarados_a_mano": declarados,
         "cuerpos_no_medidos_por_dependencia": por_dep,
+        "lector": LECTOR,
         "sin_lector": ["typescript", "yaml"],
     }
     return Superficie("servidor", tuple(operaciones), len(arboles), len(modelos), tuple(sin_medir), marco)
@@ -1051,6 +1057,14 @@ def _divergencias(campos_codigo: tuple, campos_spec: tuple, metodo: str, ruta: s
 def comparar(codigo: Superficie, spec: Superficie) -> list:
     hallazgos = []
     indice_codigo, indice_spec = _indice(codigo), _indice(spec)
+    if not codigo.operaciones and spec.operaciones:
+        # Cero rutas leidas con contrato poblado no es "el servidor no las declara":
+        # es que este lector no sabe leer ese servidor. Publicar una FALTA_EN_CODIGO
+        # por ruta seria inventar una deriva del sujeto con un defecto del instrumento.
+        return [Hallazgo("SERVIDOR_NO_LEIDO", "*", "*",
+                         f"el lector de rutas solo entiende {LECTOR} y no encontro ninguna;"
+                         f" el contrato publica {len(spec.operaciones)} operaciones: las rutas no se comparan",
+                         "WARN")]
     for clave in sorted(indice_codigo, key=lambda k: (k[1], k[0])):
         if clave not in indice_spec:
             op = indice_codigo[clave]

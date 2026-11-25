@@ -667,3 +667,62 @@ class TestContraElCorpusDeFastAPI:
         servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
         assert servidor.operaciones[0].cuerpo_por_dependencia is True
         assert servidor.marco["cuerpos_no_medidos_por_dependencia"] == 1
+
+
+class TestServidorQueElLectorNoEntiende:
+    """Cuarto oraculo: flask-smorest @ /tmp/app_flask, spec generada por el framework.
+
+    Medido el 25-Nov-2026 sobre la app de ejemplo de flask-smorest: el contrato
+    publica 3 operaciones y este lector lee 0 rutas. La respuesta correcta no es
+    "el servidor no las declara" (falso: las declara en otra forma) ni RC 0
+    (seria un falso verde en la direccion peligrosa), sino NO_MEDIDO.
+    """
+
+    FLASK = '''
+from flask.views import MethodView
+from flask_smorest import Blueprint
+
+blp = Blueprint("items", "items", url_prefix="/items")
+
+@blp.route("/")
+class Items(MethodView):
+    def get(self):
+        return []
+
+    def post(self):
+        return {}
+'''
+
+    SPEC = {
+        "openapi": "3.0.3",
+        "info": {"title": "Ejemplo smorest", "version": "v1"},
+        "paths": {
+            "/items/": {"get": {"responses": {"200": {"description": "ok"}}},
+                        "post": {"responses": {"201": {"description": "ok"}}}},
+            "/items/{item_id}": {"get": {"responses": {"200": {"description": "ok"}}}},
+        },
+    }
+
+    def _medir(self, tmp_path, fuente, spec_dict):
+        (tmp_path / "app.py").write_text(fuente)
+        codigo = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        spec = superficie_openapi(spec_dict)
+        return codigo, spec
+
+    def test_declara_que_lector_uso(self, tmp_path):
+        codigo, _ = self._medir(tmp_path, self.FLASK, self.SPEC)
+        assert codigo.marco["lector"] == "fastapi"
+
+    def test_un_aviso_que_nombra_al_lector_y_no_una_deriva_por_ruta(self, tmp_path):
+        codigo, spec = self._medir(tmp_path, self.FLASK, self.SPEC)
+        hallazgos = comparar(codigo, spec)
+        assert [h.clase for h in hallazgos] == ["SERVIDOR_NO_LEIDO"]
+        assert hallazgos[0].severidad == "WARN"
+        assert "fastapi" in hallazgos[0].detalle
+        assert "3 operaciones" in hallazgos[0].detalle
+        assert rc_de(hallazgos, codigo, spec) == 2
+
+    def test_servidor_y_contrato_vacios_siguen_en_no_medido_sin_aviso(self, tmp_path):
+        codigo, spec = self._medir(tmp_path, "x = 1\n", {"openapi": "3.0.3", "info": {}, "paths": {}})
+        assert comparar(codigo, spec) == []
+        assert rc_de([], codigo, spec) == 2
