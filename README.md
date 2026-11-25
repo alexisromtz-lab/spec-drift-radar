@@ -13,16 +13,17 @@ $ spec-drift-radar --servidor api/ --openapi openapi.json
 spec-drift-radar · la superficie del servidor contra el contrato que publica
 
 MARCO DEL SERVIDOR   archivos_py=1 · modelos=3 · rutas_codigo=2 · sin_lector=typescript,yaml
+CAMPOS LEIDOS         rutas_con_campos=2 · rutas_sin_campos=0 · prefijos_no_medidos=0 · prefijo_base=NO_DECLARADO
 MARCO DEL CONTRATO   openapi=3.1.0 · titulo=Pedidos · version=2026-11 · rutas_spec=3
 
 HALLAZGOS  rojos=6 · avisos=1 · pares_comparados=2
   [ROJO] FALTA_EN_CODIGO        POST    /pedidos/{pedido_id}/cancelar    el contrato la publica y el servidor no la declara
-  [ROJO] CAMPO_FALTA_EN_SPEC    POST    /pedidos                         el servidor declara 'cliente'; el contrato no
-  [ROJO] REQUERIDO_DIVERGENTE   POST    /pedidos                         'prioridad': servidor=opcional · contrato=requerido
-  [ROJO] CAMPO_FALTA_EN_CODIGO  POST    /pedidos                         el contrato declara 'customer'; el servidor no
-  [ROJO] TIPO_DIVERGENTE        POST    /pedidos                         'id': servidor=integer · contrato=string
-  [WARN] CODIGO_DIVERGENTE      POST    /pedidos                         servidor=[201] · spec=[200]
-  [ROJO] TIPO_DIVERGENTE        GET     /pedidos/{pedido_id}             'id': servidor=integer · contrato=string
+  [ROJO] CAMPO_FALTA_EN_SPEC    POST    /pedidos                         cuerpo 'cliente': el servidor lo declara; el contrato no
+  [ROJO] REQUERIDO_DIVERGENTE   POST    /pedidos                         cuerpo 'prioridad': servidor=opcional · contrato=requerido
+  [ROJO] CAMPO_FALTA_EN_CODIGO  POST    /pedidos                         cuerpo 'customer': el contrato lo declara; el servidor no
+  [ROJO] TIPO_DIVERGENTE        POST    /pedidos                         respuesta 'id': servidor=integer · contrato=string
+  [WARN] CODIGO_DIVERGENTE      POST    /pedidos                         servidor=[201] · contrato=[200]
+  [ROJO] TIPO_DIVERGENTE        GET     /pedidos/{pedido_id}             respuesta 'id': servidor=integer · contrato=string
 
 RC 1 · deriva medida: el contrato y el servidor no dicen lo mismo
 ```
@@ -53,7 +54,10 @@ $ spec-drift-radar --servidor api/ --openapi openapi.json --json
 # 3. derivar el contrato desde el servidor y escribirlo (arranque de una API sin spec)
 $ spec-drift-radar --servidor api/ --emitir openapi.json
 
-# 4. verificar el instrumento consigo mismo (emite, compara, muta y detecta)
+# 4. declarar el prefijo de montaje que el codigo no resuelve (`settings.API_V1_STR`)
+$ spec-drift-radar --servidor api/ --prefijo /api/v1 --emitir openapi.json
+
+# 5. verificar el instrumento consigo mismo (emite, compara, muta y detecta)
 $ spec-drift-radar --self-test
 ```
 
@@ -92,6 +96,11 @@ sólo se emite cuando las dos superficies existen.
   fuerzan RC 2.
 - Frameworks cuyo enrutado no vive en un decorador con ruta literal.
 
+**Prefijos.** El prefijo estático de un router se compone (`APIRouter(prefix="/usuarios")` +
+`@router.get("/{id}")` ⇒ `/usuarios/{id}`). Un `include_router(prefix=settings.ALGO)` con
+prefijo **no literal** no se adivina: se publica en `prefijos_no_medidos` y obliga a declarar
+`--prefijo /api/v1`. Con `--prefijo` la herramienta deja de bloquear y antepone ese valor.
+
 ## Clases de hallazgo
 
 | clase | severidad | qué significa |
@@ -106,10 +115,32 @@ sólo se emite cuando las dos superficies existen.
 
 ## Estado medido
 
-- `v0.1.0` · 20 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
-- Verificado sobre fixtures sintéticos que reproducen las siete clases de deriva de arriba;
-  **todavía no se ha medido sobre un proyecto externo real**. Cuando se mida, la cifra y el
-  repositorio van aquí; hasta entonces, este párrafo es la declaración honesta del hueco.
+- `v0.1.0` · 30 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
+  sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
+  con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
+  coinciden campo por campo ⇒ **RC 0**. Esa corrida encontró cuatro defectos del lector que hoy
+  son tests (`TestContraElGeneradorDeFastAPI`): `status_code` por atributo, `anyOf` con `null`,
+  los códigos 4xx que el generador añade solo, y hallazgos sin decir de qué lado venían.
+- **Corrida sobre código externo real**
+  ([`fastapi/full-stack-fastapi-template`](https://github.com/fastapi/full-stack-fastapi-template)
+  @ `77e550a`, 16-Nov-2026): 24 archivos ⇒ 23 operaciones en 15 rutas distintas, 21 modelos,
+  16 operaciones con campos y 7 sin cuerpo ni modelo de respuesta (declarado, no escondido).
+  RC 2, y la causa es del upstream: `backend/app/api/deps.py:36` no compila
+  (`except InvalidTokenError, ValidationError:` es sintaxis de Python 2). El lector lo publica
+  como `no parsea` en vez de saltárselo en silencio.
+- **Todavía no se ha medido la comparación contra el contrato de un proyecto externo**: hace
+  falta un repositorio que publique su `openapi.json` junto al código. Cuando exista la corrida,
+  la cifra y el commit van aquí.
+
+Reproducir la corrida externa:
+
+```console
+$ git clone --depth 1 https://github.com/fastapi/full-stack-fastapi-template.git /tmp/tpl
+$ git -C /tmp/tpl rev-parse HEAD   # 77e550a73bb49dd2967622c5ed11bf7a49603c93
+$ spec-drift-radar --servidor /tmp/tpl/backend/app --prefijo /api/v1 --emitir /tmp/tpl.json
+# contrato emitido · rutas=23 · archivos=24   (RC 2: deps.py:36 no parsea, defecto del upstream)
+```
 
 ## Familia
 

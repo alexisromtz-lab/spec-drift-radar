@@ -32,6 +32,10 @@ def _texto(codigo, spec, hallazgos, rc) -> str:
     lineas = [CABECERA, ""]
     lineas.append(f"MARCO DEL SERVIDOR   archivos_py={codigo.marco['archivos_py']} · modelos={codigo.marco['modelos']}"
                   f" · rutas_codigo={codigo.marco['rutas_codigo']} · sin_lector={','.join(codigo.marco['sin_lector'])}")
+    lineas.append(f"CAMPOS LEIDOS         rutas_con_campos={codigo.marco['rutas_con_campos']}"
+                  f" · rutas_sin_campos={codigo.marco['rutas_sin_campos']}"
+                  f" · prefijos_no_medidos={codigo.marco['prefijos_no_medidos']}"
+                  f" · prefijo_base={codigo.marco['prefijo_base']}")
     lineas.append(f"MARCO DEL CONTRATO   openapi={spec.marco.get('openapi', 'NO_MEDIDO')}"
                   f" · titulo={spec.marco.get('titulo', 'NO_MEDIDO')}"
                   f" · version={spec.marco.get('version_declarada', 'NO_MEDIDO')}"
@@ -134,6 +138,8 @@ def main(argv=None) -> int:
     parser.add_argument("--servidor", help="directorio con el codigo del servidor (se leen los .py recursivamente)")
     parser.add_argument("--openapi", help="documento OpenAPI en JSON")
     parser.add_argument("--emitir", help="escribe el contrato derivado del servidor en esta ruta y no compara")
+    parser.add_argument("--prefijo", default="",
+                        help="prefijo de montaje que el codigo no puede resolver (p. ej. /api/v1); se antepone a todas las rutas")
     parser.add_argument("--json", action="store_true", help="salida JSON con el marco y los hallazgos")
     parser.add_argument("--version", action="version", version=f"spec-drift-radar {__version__}")
     parser.add_argument("--self-test", action="store_true", help="verifica el instrumento consigo mismo")
@@ -147,7 +153,7 @@ def main(argv=None) -> int:
     if not directorio.is_dir():
         parser.error(f"--servidor no es un directorio: {directorio}")
     archivos = _archivos_py(directorio)
-    servidor = superficie_servidor(archivos)
+    servidor = superficie_servidor(archivos, prefijo_base=args.prefijo)
 
     if args.emitir:
         if not servidor.operaciones:

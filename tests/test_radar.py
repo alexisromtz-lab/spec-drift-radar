@@ -157,6 +157,108 @@ class TestDeriva:
         assert rc == 0
 
 
+class TestPrefijosYModelos:
+    def test_prefijo_de_router_se_compone_en_la_ruta(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom pydantic import BaseModel\n\n'
+            'router = APIRouter(prefix="/usuarios", tags=["usuarios"])\n\n'
+            'class Salida(BaseModel):\n    id: int\n\n'
+            '@router.get("/{id}", response_model=Salida)\ndef leer(id: int):\n    return {"id": id}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert [op.ruta for op in servidor.operaciones] == ["/usuarios/{id}"]
+
+    def test_prefijo_base_declarado_se_antepone(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n\n'
+            '@app.get("/salud")\ndef salud():\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")), prefijo_base="/api/v1")
+        assert [op.ruta for op in servidor.operaciones] == ["/api/v1/salud"]
+        assert servidor.marco["prefijo_base"] == "/api/v1"
+
+    def test_include_router_con_prefijo_no_literal_es_no_medido(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+            'app.include_router(otro, prefix=AJUSTES.API)\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert servidor.marco["prefijos_no_medidos"] == 1
+        assert any("prefijo no literal" in nota for nota in servidor.sin_medir)
+
+    def test_prefijo_base_silencia_el_hueco_declarado(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import FastAPI\napp = FastAPI()\n'
+            'app.include_router(otro, prefix=AJUSTES.API)\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")), prefijo_base="/api/v1")
+        assert servidor.sin_medir == ()
+        assert servidor.marco["prefijos_no_medidos"] == 1
+
+    def test_modelo_sqlmodel_por_herencia_indirecta(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter\nfrom sqlmodel import SQLModel, Field\n\nrouter = APIRouter()\n\n'
+            'class UsuarioBase(SQLModel):\n    email: str\n    nombre: str | None = None\n\n'
+            'class Usuario(UsuarioBase, table=True):\n    id: int | None = Field(default=None, primary_key=True)\n\n'
+            '@router.post("/usuarios")\ndef crear(usuario: Usuario):\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert servidor.marco["modelos"] == 2
+        op = servidor.operaciones[0]
+        assert {c.nombre for c in op.peticion} == {"id", "email", "nombre"}
+        assert {c.nombre for c in op.peticion if c.requerido} == {"email"}
+
+    def test_marco_publica_rutas_sin_campos(self, proyecto):
+        _, servidor, _ = proyecto
+        assert servidor.marco["rutas_con_campos"] == 2
+        assert servidor.marco["rutas_sin_campos"] == 0
+
+
+class TestContraElGeneradorDeFastAPI:
+    """El oraculo no es mi emisor: es `app.openapi()` del propio FastAPI.
+
+    Los cuatro casos de abajo son los que fallaron en la primera corrida contra el
+    generador real; quedan como contrato para que no vuelvan.
+    """
+
+    def test_status_por_atributo_se_resuelve(self, tmp_path):
+        (tmp_path / "app.py").write_text(
+            'from fastapi import APIRouter, status\n\nrouter = APIRouter(prefix="/x")\n\n'
+            '@router.post("", status_code=status.HTTP_201_CREATED)\ndef crear():\n    return {}\n',
+            encoding="utf-8",
+        )
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        assert servidor.operaciones[0].codigos == (201,)
+
+    def test_anyof_con_null_es_el_tipo_no_nulo(self, proyecto):
+        directorio, _, documento = proyecto
+        documento["components"]["schemas"]["get_items_item_id_salida"]["properties"]["id"] = {
+            "anyOf": [{"type": "integer"}, {"type": "null"}]
+        }
+        _, _, hallazgos, rc = _medir(directorio, documento)
+        assert hallazgos == []
+        assert rc == 0
+
+    def test_codigos_no_2xx_del_generador_no_son_deriva(self, proyecto):
+        directorio, _, documento = proyecto
+        documento["paths"]["/items"]["post"]["responses"]["422"] = {"description": "validation"}
+        _, _, hallazgos, rc = _medir(directorio, documento)
+        assert hallazgos == []
+        assert rc == 0
+
+    def test_el_hallazgo_dice_de_que_lado_esta(self, proyecto):
+        directorio, _, documento = proyecto
+        documento["components"]["schemas"]["post_items_entrada"]["properties"]["nombre"] = {"type": "integer"}
+        _, _, hallazgos, _ = _medir(directorio, documento)
+        assert [h.clase for h in hallazgos] == ["TIPO_DIVERGENTE"]
+        assert hallazgos[0].detalle.startswith("cuerpo 'nombre'")
+
+
 class TestNoMedido:
     def test_sin_archivos_python_es_rc_2(self, tmp_path):
         _, _, _, rc = _medir(tmp_path, emitir_openapi(superficie_servidor([])))
