@@ -7,9 +7,11 @@ from spec_drift_radar import __version__
 from spec_drift_radar.cli import main
 from spec_drift_radar.nucleo import (
     comparar,
+    comparar_contratos,
     emitir_openapi,
     leer_json,
     rc_de,
+    rc_de_contratos,
     superficie_openapi,
     superficie_servidor,
 )
@@ -42,6 +44,29 @@ def crear(item: Item):
 def leer(item_id: int):
     return {"id": item_id, "nombre": "x"}
 '''
+
+
+CONDICIONAL = """
+from fastapi import APIRouter
+
+privado = APIRouter(prefix="/privado")
+router = APIRouter()
+API = "development"
+
+
+@privado.post("/usuarios")
+def crear():
+    return {}
+
+
+@router.get("/salud")
+def salud():
+    return {}
+
+
+if API == "development":
+    router.include_router(privado)
+"""
 
 
 @pytest.fixture
@@ -726,3 +751,242 @@ class Items(MethodView):
         codigo, spec = self._medir(tmp_path, "x = 1\n", {"openapi": "3.0.3", "info": {}, "paths": {}})
         assert comparar(codigo, spec) == []
         assert rc_de([], codigo, spec) == 2
+
+
+def _contrato(paths, esquemas=None):
+    return {"openapi": "3.1.0", "info": {"title": "t", "version": "1"}, "paths": paths,
+            "components": {"schemas": esquemas or {}}}
+
+
+def _cuerpo(nombre_schema):
+    return {"content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{nombre_schema}"}}}}
+
+
+ESQUEMA_ITEM = {"type": "object", "required": ["nombre"],
+                "properties": {"nombre": {"type": "string"}, "precio": {"type": "number"}}}
+
+
+class TestDerivaEntreContratos:
+    """Modo contrato contra contrato: dos documentos, direccion `anterior -> nuevo`.
+
+    El veredicto es asimetrico: perder algo o volverlo obligatorio rompe a un cliente
+    que hoy funciona; anadir un campo opcional no. Un cambio de tipo cuenta como
+    ruptura aunque pudiera ser un ensanche, porque este lector no conoce los subtipos.
+    """
+
+    def _medir(self, anterior, nuevo):
+        viejo = superficie_openapi(anterior)
+        actual = superficie_openapi(nuevo)
+        hallazgos = comparar_contratos(viejo, actual)
+        return hallazgos, rc_de_contratos(hallazgos, viejo, actual)
+
+    def _caso(self, anterior, nuevo):
+        hallazgos, rc = self._medir(anterior, nuevo)
+        return [h.clase for h in hallazgos], rc
+
+    def test_el_mismo_contrato_es_compatible(self):
+        contrato = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item"),
+                                                  "responses": {"200": {"description": ""}}}}},
+                             {"Item": ESQUEMA_ITEM})
+        assert self._caso(contrato, contrato) == ([], 0)
+
+    def test_una_operacion_que_desaparece_rompe(self):
+        anterior = _contrato({"/items": {"get": {"responses": {}}},
+                              "/otros": {"get": {"responses": {}}}})
+        nuevo = _contrato({"/items": {"get": {"responses": {}}}})
+        assert self._caso(anterior, nuevo) == (["OPERACION_ELIMINADA"], 1)
+
+    def test_una_operacion_nueva_no_rompe(self):
+        anterior = _contrato({"/items": {"get": {"responses": {}}}})
+        nuevo = _contrato({"/items": {"get": {"responses": {}}}, "/otros": {"get": {"responses": {}}}})
+        assert self._caso(anterior, nuevo) == (["OPERACION_ANADIDA"], 0)
+
+    def test_una_condicional_que_desaparece_no_se_mide_como_ruptura(self):
+        op = {"get": {"responses": {}, "x-spec-drift-radar-condicional": True}}
+        comun = {"get": {"responses": {}}}
+        assert self._caso(_contrato({"/salud": comun, "/privado": op}),
+                          _contrato({"/salud": comun})) == (
+            ["OPERACION_CONDICIONAL_ELIMINADA"], 0)
+
+    def test_un_campo_de_peticion_eliminado_rompe(self):
+        anterior = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": ESQUEMA_ITEM})
+        sin_precio = {"type": "object", "required": ["nombre"],
+                      "properties": {"nombre": {"type": "string"}}}
+        nuevo = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": sin_precio})
+        assert self._caso(anterior, nuevo) == (["CAMPO_ELIMINADO"], 1)
+
+    def test_un_campo_de_respuesta_eliminado_rompe(self):
+        respuesta = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Item"}}}}
+        anterior = _contrato({"/items": {"get": {"responses": {"200": respuesta}}}}, {"Item": ESQUEMA_ITEM})
+        # `precio` era obligatorio en `Item` y desaparece: la respuesta lo pierde y el modelo
+        # tambien lo relaja. Dos hechos distintos, un solo RC.
+        sin_precio = {"type": "object", "properties": {"nombre": {"type": "string"}}}
+        nuevo = _contrato({"/items": {"get": {"responses": {"200": respuesta}}}}, {"Item": sin_precio})
+        assert self._caso(anterior, nuevo) == (["CAMPO_ELIMINADO", "REQUERIDO_RELAJADO"], 1)
+
+    def test_un_campo_nuevo_y_obligatorio_rompe_y_si_es_opcional_no(self):
+        opcional = {"type": "object", "properties": {"nombre": {"type": "string"},
+                                                      "precio": {"type": "number"}},
+                    "required": ["nombre"]}
+        obligatorio = {"type": "object", "required": ["nombre", "precio"],
+                       "properties": {"nombre": {"type": "string"}, "precio": {"type": "number"}}}
+        sin_precio = {"type": "object", "properties": {"nombre": {"type": "string"}},
+                      "required": ["nombre"]}
+        laxo = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": sin_precio})
+        duro = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": obligatorio})
+        opcional_nuevo = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": opcional})
+        assert self._caso(laxo, duro) == (["CAMPO_REQUERIDO_NUEVO"], 1)
+        assert self._caso(laxo, opcional_nuevo) == (["CAMPO_OPCIONAL_NUEVO"], 0)
+
+    def test_un_opcional_que_pasa_a_obligatorio_rompe_y_al_reves_no(self):
+        opcional = {"type": "object", "properties": {"nombre": {"type": "string"},
+                                                     "precio": {"type": "number"}},
+                    "required": ["nombre"]}
+        obligatorio = {"type": "object", "required": ["nombre", "precio"],
+                       "properties": {"nombre": {"type": "string"}, "precio": {"type": "number"}}}
+        laxo = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": opcional})
+        duro = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": obligatorio})
+        assert self._caso(laxo, duro) == (["REQUERIDO_ENDURECIDO"], 1)
+        assert self._caso(duro, laxo) == (["REQUERIDO_RELAJADO"], 0)
+
+    def test_un_tipo_que_cambia_rompe(self):
+        texto = {"type": "object", "required": ["precio"],
+                 "properties": {"precio": {"type": "string"}}}
+        numero = {"type": "object", "required": ["precio"],
+                  "properties": {"precio": {"type": "number"}}}
+        a = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": texto})
+        b = _contrato({"/items": {"post": {"requestBody": _cuerpo("Item")}}}, {"Item": numero})
+        assert self._caso(a, b) == (["TIPO_CAMBIADO"], 1)
+
+    def test_un_exito_que_deja_de_publicarse_rompe(self):
+        anterior = _contrato({"/items": {"post": {"responses": {"201": {"description": ""}}}}})
+        nuevo = _contrato({"/items": {"post": {"responses": {"200": {"description": ""}}}}})
+        assert self._caso(anterior, nuevo) == (["CODIGO_ELIMINADO", "CODIGO_ANADIDO"], 1)
+
+    def test_dos_documentos_vacios_son_no_medido_no_compatibles(self):
+        assert self._caso(_contrato({}), _contrato({})) == ([], 2)
+
+    def test_el_contrato_emitido_vuelve_a_leerse_sin_deriva(self, tmp_path):
+        (tmp_path / "app.py").write_text(CODIGO)
+        servidor = superficie_servidor(sorted(tmp_path.rglob("*.py")))
+        emitido = emitir_openapi(servidor)
+        hallazgos, rc = self._medir(emitido, emitido)
+        assert (hallazgos, rc) == ([], 0)
+
+    def test_el_emitido_marca_las_rutas_condicionales(self, tmp_path):
+        (tmp_path / "app.py").write_text(CONDICIONAL)
+        emitido = emitir_openapi(superficie_servidor(sorted(tmp_path.rglob("*.py"))))
+        marcas = [op for item in emitido["paths"].values() for op in item.values()
+                  if op.get("x-spec-drift-radar-condicional")]
+        assert len(marcas) == 1
+
+
+class TestCliDeContratos:
+    def _escribir(self, tmp_path, nombre, contrato):
+        ruta = tmp_path / nombre
+        ruta.write_text(json.dumps(contrato))
+        return str(ruta)
+
+    def test_rc_1_y_json_cuando_hay_ruptura(self, tmp_path, capsys):
+        stays = {"get": {"responses": {}}}
+        anterior = self._escribir(tmp_path, "a.json",
+                                  _contrato({"/items": stays, "/otros": {"post": {"responses": {}}}}))
+        nuevo = self._escribir(tmp_path, "b.json", _contrato({"/items": stays}))
+        assert main(["--contrato-anterior", anterior, "--openapi", nuevo, "--json"]) == 1
+        salida = json.loads(capsys.readouterr().out)
+        assert salida["rc"] == 1
+        assert [h["clase"] for h in salida["hallazgos"]] == ["OPERACION_ELIMINADA"]
+
+    def test_rc_2_cuando_la_version_anterior_no_existe(self, tmp_path):
+        nuevo = self._escribir(tmp_path, "b.json", _contrato({"/items": {"get": {"responses": {}}}}))
+        assert main(["--contrato-anterior", str(tmp_path / "no.json"), "--openapi", nuevo]) == 2
+
+    def test_no_mezcla_servidor_y_dos_contratos(self, tmp_path):
+        ruta = self._escribir(tmp_path, "a.json", _contrato({}))
+        with pytest.raises(SystemExit) as fallo:
+            main(["--contrato-anterior", ruta, "--openapi", ruta, "--servidor", str(tmp_path)])
+        assert fallo.value.code == 2
+
+
+class TestDialectoYModelosNombrados:
+    """El contrato de Kubernetes es swagger 2.0 y su deriva vive en los modelos, no en las rutas.
+
+    Probado con dos releases publicadas (1.28.0 -> 1.29.0): 544 modelos comparados, la retirada
+    de `clustercidrs`, el alta de `servicecidrs` y el campo `volumeAttributesClassName`.
+    """
+
+    @staticmethod
+    def _swagger2(operaciones, definiciones):
+        return {"swagger": "2.0", "info": {"title": "prueba", "version": "1"},
+                "paths": operaciones, "definitions": definiciones}
+
+    def test_lee_un_swagger_2_0_con_cuerpo_en_parameters_y_schema_en_respuesta(self):
+        doc = self._swagger2(
+            {"/pods": {"post": {"parameters": [{"in": "body", "name": "body", "required": True,
+                                                "schema": {"$ref": "#/definitions/Pod"}}],
+                                "responses": {"200": {"schema": {"$ref": "#/definitions/Pod"}}}}}},
+            {"Pod": {"type": "object", "required": ["kind"],
+                     "properties": {"kind": {"type": "string"}, "metadata": {"type": "object"}}}})
+        superficie = superficie_openapi(doc)
+        assert superficie.marco["dialecto"] == "swagger 2.0"
+        assert superficie.marco["esquemas"] == 1
+        op = superficie.operaciones[0]
+        assert [(c.nombre, c.tipo, c.requerido) for c in op.peticion] == [
+            ("kind", "string", True), ("metadata", "object", False)]
+        assert [c.nombre for c in op.respuesta] == ["kind", "metadata"]
+        assert superficie.sin_medir == ()
+
+    def test_un_dialecto_desconocido_no_es_un_cero(self):
+        doc = {"paths": {"/pods": {"get": {"responses": {}}}}, "info": {"title": "sin dialecto"}}
+        superficie = superficie_openapi(doc)
+        assert superficie.marco["dialecto"] == "NO_MEDIDO"
+        assert superficie.sin_medir and "cuerpos no se leen" in superficie.sin_medir[0]
+        assert rc_de_contratos([], superficie, superficie) == 2
+
+    def test_la_deriva_de_un_modelo_se_mide_aunque_la_operacion_no_cambie(self):
+        envoltorio = {"/pods": {"get": {"responses": {"200": {"content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/PodList"}}}}}}}}
+        listado = {"type": "object", "properties": {"items": {"type": "array"}}}
+        pod = {"type": "object", "properties": {"kind": {"type": "string"},
+                                                "uid": {"type": "string"}}}
+        sin_uid = {"type": "object", "properties": {"kind": {"type": "string"}}}
+        anterior = _contrato(envoltorio, {"PodList": listado, "Pod": pod})
+        nuevo = _contrato(envoltorio, {"PodList": listado, "Pod": sin_uid})
+        hallazgos = comparar_contratos(superficie_openapi(anterior), superficie_openapi(nuevo))
+        assert [(h.clase, h.metodo, h.ruta) for h in hallazgos] == [("CAMPO_ELIMINADO", "esquema", "Pod")]
+        assert rc_de_contratos(hallazgos, superficie_openapi(anterior), superficie_openapi(nuevo)) == 1
+
+    def test_un_campo_perdido_se_publica_una_sola_vez(self):
+        cuerpo = {"requestBody": {"content": {"application/json": {
+            "schema": {"$ref": "#/components/schemas/Item"}}}}}
+        con_dos = {"type": "object", "properties": {"nombre": {"type": "string"},
+                                                    "precio": {"type": "number"}}}
+        con_uno = {"type": "object", "properties": {"nombre": {"type": "string"}}}
+        anterior = _contrato({"/items": {"post": cuerpo}}, {"Item": con_dos})
+        nuevo = _contrato({"/items": {"post": cuerpo}}, {"Item": con_uno})
+        hallazgos = comparar_contratos(superficie_openapi(anterior), superficie_openapi(nuevo))
+        perdidos = [h for h in hallazgos if h.clase == "CAMPO_ELIMINADO"]
+        assert [(h.metodo, h.campo) for h in perdidos] == [("post", "precio")]
+
+    def test_un_modelo_nuevo_es_aviso_y_no_ruptura(self):
+        stays = {"get": {"responses": {}}}
+        anterior = _contrato({"/items": stays}, {"Item": {"type": "object", "properties": {}}})
+        nuevo = _contrato({"/items": stays}, {"Item": {"type": "object", "properties": {}},
+                                             "Otro": {"type": "object", "properties": {}}})
+        hallazgos = comparar_contratos(superficie_openapi(anterior), superficie_openapi(nuevo))
+        assert [(h.clase, h.severidad) for h in hallazgos] == [("ESQUEMA_ANADIDO", "WARN")]
+        assert rc_de_contratos(hallazgos, superficie_openapi(anterior), superficie_openapi(nuevo)) == 0
+
+    def test_el_cli_compara_dos_swagger_2_0(self, tmp_path, capsys):
+        definiciones = {"Pod": {"type": "object", "properties": {"kind": {"type": "string"},
+                                                               "uid": {"type": "string"}}}}
+        sin_uid = {"Pod": {"type": "object", "properties": {"kind": {"type": "string"}}}}
+        ops = {"/pods": {"get": {"responses": {"200": {"schema": {"$ref": "#/definitions/Pod"}}}}}}
+        anterior = tmp_path / "1.28.json"
+        nuevo = tmp_path / "1.29.json"
+        anterior.write_text(json.dumps(self._swagger2(ops, definiciones)))
+        nuevo.write_text(json.dumps(self._swagger2(ops, sin_uid)))
+        assert main(["--contrato-anterior", str(anterior), "--openapi", str(nuevo), "--json"]) == 1
+        salida = json.loads(capsys.readouterr().out)
+        assert salida["rc"] == 1
+        assert {h["clase"] for h in salida["hallazgos"]} == {"CAMPO_ELIMINADO"}

@@ -86,6 +86,10 @@ class Superficie:
     modelos: int
     sin_medir: tuple
     marco: dict
+    # Definiciones nombradas del contrato (`components.schemas` o `definitions`), con sus
+    # campos de primer nivel. En un contrato como el de Kubernetes la deriva real vive aqui:
+    # las operaciones solo devuelven envoltorios (`PodList`) y el modelo esta un `$ref` mas abajo.
+    definiciones: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,9 @@ class Hallazgo:
     ruta: str
     detalle: str
     severidad: str
+    # Campo al que se refiere el hallazgo, cuando lo hay: dos hallazgos con la misma
+    # clase y el mismo campo son el mismo hecho visto desde dos locus, y se publican una vez.
+    campo: str = ""
 
 
 # --- lector 1: AST del servidor ---------------------------------------------
@@ -103,6 +110,9 @@ class Hallazgo:
 #: superficie vacia no distingue "el servidor no declara rutas" de "aqui no hay
 #: FastAPI", y esas dos cosas no se contestan igual.
 LECTOR = "fastapi"
+
+#: Marca con la que el contrato emitido publica una ruta que el AST vio dentro de un `if`.
+CONDICIONAL = "x-spec-drift-radar-condicional"
 
 
 GENERICOS_DE_UN_SOLO_ARG = ("Optional[", "list[", "List[", "Sequence[", "set[", "Set[", "tuple[", "Tuple[")
@@ -948,8 +958,37 @@ def _campos_schema(schema: dict, componentes: dict) -> tuple:
     )
 
 
-def _cuerpo(op: dict) -> dict:
+DIALECTOS = ("openapi", "swagger")
+
+
+def _dialecto(documento: dict) -> tuple:
+    """Dialecto declarado por el propio documento, o `NO_MEDIDO`.
+
+    Swagger 2.0 y OpenAPI 3.x no comparten ni el sitio de los esquemas (`definitions` frente a
+    `components.schemas`) ni el del cuerpo (`parameters[in=body]` frente a `requestBody`). Leer
+    un 2.0 con el lector de 3.x no falla: devuelve 865 operaciones con cero campos, que es un
+    verde barato sobre un contrato que nunca se miro.
+    """
+    if isinstance(documento.get("openapi"), str):
+        return "openapi", documento["openapi"]
+    if str(documento.get("swagger")) == "2.0":
+        return "swagger", "2.0"
+    return "desconocido", "NO_MEDIDO"
+
+
+def _esquemas_declarados(documento: dict, dialecto: str) -> dict:
+    if dialecto == "swagger":
+        return documento.get("definitions") or {}
+    return ((documento.get("components") or {}).get("schemas")) or {}
+
+
+def _cuerpo(op: dict, dialecto: str = "openapi") -> dict:
     """El cuerpo declarado, sea JSON o de formulario: los nombres se comparan igual."""
+    if dialecto == "swagger":
+        for parametro in op.get("parameters") or ():
+            if isinstance(parametro, dict) and parametro.get("in") == "body":
+                return parametro.get("schema") or {}
+        return {}
     contenido = (op.get("requestBody") or {}).get("content") or {}
     for tipo, valor in contenido.items():
         if "json" in tipo:
@@ -960,13 +999,15 @@ def _cuerpo(op: dict) -> dict:
     return {}
 
 
-def _respuesta(op: dict) -> dict:
+def _respuesta(op: dict, dialecto: str = "openapi") -> dict:
     respuestas = op.get("responses") or {}
     exitosas = sorted(
         (int(c), v) for c, v in respuestas.items() if str(c).isdigit() and 200 <= int(c) < 300
     )
     if not exitosas:
         return {}
+    if dialecto == "swagger":
+        return (exitosas[0][1] or {}).get("schema") or {}
     contenido = (exitosas[0][1] or {}).get("content") or {}
     for tipo, valor in contenido.items():
         if "json" in tipo:
@@ -977,7 +1018,8 @@ def _respuesta(op: dict) -> dict:
 def superficie_openapi(documento: dict) -> Superficie:
     if not isinstance(documento, dict):
         return Superficie("openapi", (), 0, 0, ("el documento no es un objeto JSON",), {})
-    componentes = ((documento.get("components") or {}).get("schemas")) or {}
+    dialecto, version_dialecto = _dialecto(documento)
+    componentes = _esquemas_declarados(documento, dialecto)
     # `webhooks` es una seccion hermana de `paths` (OpenAPI 3.1): mismo lector, otro espacio de nombres.
     secciones = [("", documento.get("paths") or {}), ("webhooks/", documento.get("webhooks") or {})]
     operaciones = []
@@ -993,22 +1035,39 @@ def superficie_openapi(documento: dict) -> Superficie:
                     Operacion(
                         metodo.lower(),
                         _sin_convertidor(f"{prefijo}{camino}"),
-                        _campos_schema(_cuerpo(op), componentes),
-                        _campos_schema(_respuesta(op), componentes),
+                        _campos_schema(_cuerpo(op, dialecto), componentes),
+                        _campos_schema(_respuesta(op, dialecto), componentes),
                         codigos,
                         "openapi",
+                        condicional=bool(op.get(CONDICIONAL)),
                     )
                 )
     info = documento.get("info") or {}
     marco = {
         "openapi": documento.get("openapi") or documento.get("swagger") or "NO_MEDIDO",
+        "dialecto": f"{dialecto} {version_dialecto}" if dialecto != "desconocido" else "NO_MEDIDO",
         "titulo": info.get("title") or "NO_MEDIDO",
         "version_declarada": info.get("version") or "NO_MEDIDO",
         "rutas_spec": len(operaciones),
         "esquemas": len(componentes),
     }
-    sin_medir = () if operaciones else ("el documento no declara ninguna operacion",)
-    return Superficie("openapi", tuple(operaciones), 1, len(componentes), tuple(sin_medir), marco)
+    if not operaciones:
+        sin_medir = ("el documento no declara ninguna operacion",)
+    elif dialecto not in DIALECTOS:
+        # Un dialecto que este lector no conoce deja el documento sin cuerpos: las rutas
+        # se comparan, los mensajes no, y eso no es un cero.
+        sin_medir = ("el documento no se declara OpenAPI 3.x ni Swagger 2.0:"
+                     " las rutas se comparan y los cuerpos no se leen",)
+    else:
+        sin_medir = ()
+    definiciones = tuple(
+        (nombre, _campos_schema(esquema, componentes))
+        for nombre, esquema in sorted(componentes.items())
+        if isinstance(esquema, dict)
+    )
+    marco["profundidad_campos"] = 1
+    return Superficie("openapi", tuple(operaciones), 1, len(componentes), tuple(sin_medir), marco,
+                      definiciones)
 
 
 # --- comparacion ------------------------------------------------------------
@@ -1095,6 +1154,130 @@ def comparar(codigo: Superficie, spec: Superficie) -> list:
     return hallazgos
 
 
+def _deriva_de_campos(viejos: tuple, nuevos: tuple, metodo: str, ruta: str, lado: str) -> list:
+    """Deriva de un lado del mensaje entre dos versiones del mismo contrato.
+
+    El veredicto es asimetrico a proposito: lo que rompe a un cliente que hoy
+    funciona es perder algo, o que algo pase a ser obligatorio. Anadir campo
+    opcional no rompe nada y no puede pesar lo mismo.
+
+    `lado="esquema"` mide un modelo nombrado, del que el contrato no dice si se usa
+    como peticion o como respuesta: ahi se asume el uso como peticion, que es el que
+    rompe. Se declara porque es una suposicion, no una lectura.
+    """
+    salida = []
+    viejos_por_nombre = {c.nombre: c for c in viejos}
+    nuevos_por_nombre = {c.nombre: c for c in nuevos}
+    for nombre in sorted(viejos_por_nombre):
+        viejo = viejos_por_nombre[nombre]
+        if nombre not in nuevos_por_nombre:
+            salida.append(Hallazgo("CAMPO_ELIMINADO", metodo, ruta,
+                                   f"{lado} '{nombre}': la version anterior lo publicaba y esta no", "ROJO", campo=nombre))
+            continue
+        nuevo = nuevos_por_nombre[nombre]
+        if viejo.tipo != nuevo.tipo:
+            salida.append(Hallazgo("TIPO_CAMBIADO", metodo, ruta,
+                                   f"{lado} '{nombre}': anterior={viejo.tipo} · nuevo={nuevo.tipo}", "ROJO", campo=nombre))
+        if lado != "respuesta" and not viejo.requerido and nuevo.requerido:
+            salida.append(Hallazgo("REQUERIDO_ENDURECIDO", metodo, ruta,
+                                   f"{lado} '{nombre}': era opcional y ahora es obligatorio", "ROJO", campo=nombre))
+        if lado != "respuesta" and viejo.requerido and not nuevo.requerido:
+            salida.append(Hallazgo("REQUERIDO_RELAJADO", metodo, ruta,
+                                   f"{lado} '{nombre}': era obligatorio y ahora es opcional", "WARN", campo=nombre))
+    for nombre in sorted(nuevos_por_nombre):
+        if nombre in viejos_por_nombre:
+            continue
+        if lado != "respuesta" and nuevos_por_nombre[nombre].requerido:
+            salida.append(Hallazgo("CAMPO_REQUERIDO_NUEVO", metodo, ruta,
+                                   f"{lado} '{nombre}': no existia y ahora es obligatorio", "ROJO", campo=nombre))
+        else:
+            salida.append(Hallazgo("CAMPO_OPCIONAL_NUEVO", metodo, ruta,
+                                   f"{lado} '{nombre}': campo nuevo y opcional", "WARN", campo=nombre))
+    return salida
+
+
+def comparar_contratos(anterior: Superficie, nuevo: Superficie) -> list:
+    """Deriva de `anterior` a `nuevo`: las dos superficies son documentos, no codigo.
+
+    Un cambio de tipo cuenta como ruptura aunque pudiera ser un ensanche: este
+    lector no conoce la relacion de subtipos entre `number` e `integer`, y decir
+    "compatible" sin poder medirlo seria un verde barato.
+    """
+    hallazgos = []
+    viejas, nuevas = _indice(anterior), _indice(nuevo)
+    for clave in sorted(viejas, key=lambda k: (k[1], k[0])):
+        if clave in nuevas:
+            continue
+        vieja = viejas[clave]
+        if vieja.condicional:
+            hallazgos.append(Hallazgo("OPERACION_CONDICIONAL_ELIMINADA", clave[0], clave[1],
+                                      f"la version anterior la marcaba `{CONDICIONAL}`: no consta que"
+                                      " se publicara, asi que su retirada no se mide como ruptura", "WARN"))
+        else:
+            hallazgos.append(Hallazgo("OPERACION_ELIMINADA", clave[0], clave[1],
+                                      "la version anterior la publicaba y esta no", "ROJO"))
+    for clave in sorted(nuevas, key=lambda k: (k[1], k[0])):
+        if clave not in viejas:
+            hallazgos.append(Hallazgo("OPERACION_ANADIDA", clave[0], clave[1],
+                                      "operacion nueva; no rompe a ningun cliente existente", "WARN"))
+    for clave in sorted(set(viejas) & set(nuevas), key=lambda k: (k[1], k[0])):
+        vieja, nueva = viejas[clave], nuevas[clave]
+        hallazgos.extend(_deriva_de_campos(vieja.peticion, nueva.peticion, clave[0], clave[1], "peticion"))
+        hallazgos.extend(_deriva_de_campos(vieja.respuesta, nueva.respuesta, clave[0], clave[1], "respuesta"))
+        exitos_viejos = {c for c in vieja.codigos if 200 <= c < 300}
+        exitos_nuevos = {c for c in nueva.codigos if 200 <= c < 300}
+        for codigo in sorted(exitos_viejos - exitos_nuevos):
+            hallazgos.append(Hallazgo("CODIGO_ELIMINADO", clave[0], clave[1],
+                                      f"el exito {codigo} ya no se publica; un cliente que lo espera se rompe", "ROJO"))
+        for codigo in sorted(exitos_nuevos - exitos_viejos):
+            hallazgos.append(Hallazgo("CODIGO_ANADIDO", clave[0], clave[1],
+                                      f"exito {codigo} nuevo; el cliente anterior no lo contempla", "WARN"))
+    hallazgos.extend(_deriva_de_definiciones(anterior.definiciones, nuevo.definiciones))
+    # Un campo perdido se publica una sola vez: en la operacion, si ahi se ve, y en el modelo
+    # solo cuando ninguna operacion lo incrusta. Contarlo dos veces inflaria el informe con un
+    # hecho y dos locus, y el que lee creeria que hay dos rupturas.
+    vistos = {(h.clase, h.campo) for h in hallazgos if h.metodo != "esquema" and h.campo}
+    return [h for h in hallazgos
+            if h.metodo != "esquema" or not h.campo or (h.clase, h.campo) not in vistos]
+
+
+def _deriva_de_definiciones(viejas: tuple, nuevas: tuple) -> list:
+    """Deriva de los modelos nombrados: `metodo='esquema'`, `ruta=<nombre del modelo>`.
+
+    Sin este eje el comparador solo veria el envoltorio de cada operacion. En un contrato
+    generado por anotaciones el envoltorio casi nunca cambia: cambia el modelo que referencia.
+    """
+    salida = []
+    indice_viejo, indice_nuevo = dict(viejas), dict(nuevas)
+    for nombre in sorted(indice_viejo):
+        if nombre not in indice_nuevo:
+            salida.append(Hallazgo("ESQUEMA_ELIMINADO", "esquema", nombre,
+                                   "el modelo ya no se publica; si algo lo referenciaba, sus campos"
+                                   " apareceran como eliminados en la operacion que lo usa", "WARN"))
+            continue
+        salida.extend(_deriva_de_campos(indice_viejo[nombre], indice_nuevo[nombre], "esquema", nombre, "campo"))
+    for nombre in sorted(indice_nuevo):
+        if nombre not in indice_viejo:
+            salida.append(Hallazgo("ESQUEMA_ANADIDO", "esquema", nombre,
+                                   "modelo nuevo; no rompe a ningun cliente existente", "WARN"))
+    return salida
+
+
+def rc_de_contratos(hallazgos, anterior: Superficie, nuevo: Superficie) -> int:
+    """1 ruptura medida · 2 NO_MEDIDO · 0 compatible.
+
+    Dos documentos vacios no son dos documentos compatibles: son dos documentos
+    sin universo, y ahi un cero tampoco es un cero.
+    """
+    if not anterior.operaciones or not nuevo.operaciones:
+        return 2
+    if any(h.severidad == "ROJO" for h in hallazgos):
+        return 1
+    if anterior.sin_medir or nuevo.sin_medir:
+        return 2
+    return 0
+
+
 def rc_de(hallazgos, codigo: Superficie, spec: Superficie) -> int:
     """1 deriva medida · 2 NO_MEDIDO (universo vacio o lectura incompleta) · 0 limpio.
 
@@ -1138,6 +1321,10 @@ def emitir_openapi(codigo: Superficie, titulo: str = "emitido por spec-drift-rad
         if op.respuesta:
             respuesta["content"] = {"application/json": {"schema": {"$ref": f"#/components/schemas/{nombre}_salida"}}}
         entrada["responses"] = {str(codigo_ok[0]): respuesta}
+        if op.condicional:
+            # La ruta existe en el AST dentro de un `if` que no se evaluo: emitirla sin
+            # marca seria publicar como cierto algo que el servidor puede no montar.
+            entrada["x-spec-drift-radar-condicional"] = True
         paths.setdefault(op.ruta, {})[op.metodo] = entrada
     return {
         "openapi": "3.1.0",

@@ -57,13 +57,82 @@ $ spec-drift-radar --servidor api/ --emitir openapi.json
 # 4. anteponer un prefijo de montaje que el codigo no resuelve (caso raro, ver «Prefijos»)
 $ spec-drift-radar --servidor api/ --prefijo /api/v1 --emitir openapi.json
 
-# 5. verificar el instrumento consigo mismo (emite, compara, muta y detecta)
+# 5. comparar dos versiones del MISMO contrato (deriva de contrato, no de codigo)
+$ spec-drift-radar --contrato-anterior main.json --openapi pr.json
+
+# 6. verificar el instrumento consigo mismo (emite, compara, muta y detecta)
 $ spec-drift-radar --self-test
 ```
 
 `--emitir` seguido de una comparación contra el archivo emitido da **RC 0**: los dos lectores
 son el mismo predicado visto desde dos representaciones, y el self-test lo exige en cada
 ejecución.
+
+## Deriva entre dos versiones del contrato
+
+El modo anterior compara **código contra contrato**. Este compara **contrato contra contrato**:
+lo que cambia entre la versión que hoy consumen los clientes y la que va a publicar el PR. Es la
+pregunta que se hace antes de mergear, y no necesita el servidor en marcha.
+
+```console
+$ spec-drift-radar --contrato-anterior main.json --openapi pr.json
+spec-drift-radar · la deriva entre dos versiones del contrato
+
+MARCO ANTERIOR   dialecto=openapi 3.1.0 · titulo=Pedidos · version=1.0.0 · rutas_spec=1 · esquemas=1
+MARCO NUEVO      dialecto=openapi 3.1.0 · titulo=Pedidos · version=1.1.0 · rutas_spec=2 · esquemas=1
+
+HALLAZGOS  rojos=1 · avisos=2 · operaciones_comparadas=1 · esquemas_comparados=1
+  [WARN] OPERACION_ANADIDA      POST    /pedidos/{pedido_id}/notas       operacion nueva; no rompe a ningun cliente existente
+  [ROJO] CAMPO_REQUERIDO_NUEVO  POST    /pedidos                         peticion 'canal': no existia y ahora es obligatorio
+  [WARN] CAMPO_OPCIONAL_NUEVO   POST    /pedidos                         respuesta 'canal': campo nuevo y opcional
+
+RC 1 · ruptura medida: un cliente de la version anterior deja de funcionar
+```
+
+La asimetría es el veredicto, no un detalle: **perder** algo, o que algo pase a ser
+**obligatorio**, rompe clientes (`ROJO`); **añadir** algo opcional o una operación nueva no
+rompe nada (`WARN`, no fuerza RC 1). Un cambio de tipo cuenta como ruptura aunque pudiera ser un
+ensanche (`integer` → `number`), porque este lector no conoce la relación de subtipos y decir
+«compatible» sin poder medirlo sería un verde barato.
+
+Se mide en **dos ejes**, y cada campo se publica **una sola vez**:
+
+| eje | `metodo` del hallazgo | qué cubre |
+|---|---|---|
+| operaciones | `get`, `post`, … | rutas, cuerpo, respuesta y códigos de éxito de cada operación |
+| modelos nombrados | `esquema` | los campos de primer nivel de `components.schemas` / `definitions` |
+
+Sin el segundo eje el radar sólo vería el envoltorio de cada operación. En un contrato generado
+por anotaciones el envoltorio casi nunca cambia: **cambia el modelo que referencia**. Si un campo
+perdido se ve en la operación y en el modelo, se publica en la operación (el locus del cliente);
+el eje de modelos sólo habla cuando ninguna operación incrusta ese modelo. Sobre un modelo el
+contrato no dice si se usa como petición o como respuesta, así que ahí se **asume petición**, que
+es el uso que rompe: es una suposición declarada, no una lectura.
+
+| clase | severidad | qué significa |
+|---|---|---|
+| `OPERACION_ELIMINADA` | ROJO | la versión anterior publicaba la ruta y esta no |
+| `OPERACION_ANADIDA` | WARN | operación nueva; no rompe a ningún cliente existente |
+| `OPERACION_CONDICIONAL_ELIMINADA` | WARN | la anterior la marcaba `x-spec-drift-radar-condicional`: no consta que se publicara |
+| `CAMPO_ELIMINADO` | ROJO | el campo existía y ya no se publica |
+| `TIPO_CAMBIADO` | ROJO | mismo campo, distinto tipo |
+| `REQUERIDO_ENDURECIDO` | ROJO | era opcional y ahora es obligatorio |
+| `REQUERIDO_RELAJADO` | WARN | era obligatorio y ahora es opcional |
+| `CAMPO_REQUERIDO_NUEVO` | ROJO | no existía y ahora es obligatorio |
+| `CAMPO_OPCIONAL_NUEVO` | WARN | campo nuevo y opcional |
+| `CODIGO_ELIMINADO` | ROJO | el éxito `2xx` ya no se publica |
+| `CODIGO_ANADIDO` | WARN | éxito `2xx` nuevo |
+| `ESQUEMA_ELIMINADO` / `ESQUEMA_ANADIDO` | WARN | modelo nombrado que aparece o desaparece del contrato |
+
+**Dialectos.** Se leen **OpenAPI 3.x** y **Swagger 2.0**, que no comparten ni el sitio de los
+esquemas (`components.schemas` / `definitions`) ni el del cuerpo (`requestBody` /
+`parameters[in=body]`). Leer un 2.0 con el lector de 3.x no fallaba: devolvía 865 operaciones con
+cero campos y un `RC 0` sobre un contrato que nunca se miró. Un documento que no se declara en
+ninguno de los dos dialectos publica `sin_medir` y **RC 2**: las rutas se comparan, los cuerpos no.
+
+Un `emitir` que se compara con el contrato ya publicado mide la frontera entre dos lectores, no una
+deriva: el contrato emitido marca `x-spec-drift-radar-condicional: true` en las rutas que el AST
+vio dentro de un `if`, y el radar lo lee de vuelta para no contar su retirada como ruptura.
 
 ## Códigos de salida
 
@@ -82,6 +151,9 @@ sólo se emite cuando las dos superficies existen.
 
 **Lee**
 
+- Contrato: **OpenAPI 3.x** y **Swagger 2.0**, en JSON. El dialecto declarado por el documento se
+  publica en el marco (`dialecto=`); uno que no se declare en ninguno de los dos no se lee a
+  medias: las rutas se comparan, los cuerpos no, y el RC es 2.
 - Servidor: AST de Python. Routers estilo FastAPI (`@router.get/post/...` con ruta literal),
   modelos Pydantic por herencia declarada (`BaseModel`) **y** `@dataclass` de pydantic,
   `Optional[...]`, `X | None`, `Annotated[T, Body(embed=True)]`, valores por defecto
@@ -148,7 +220,7 @@ valor en vez de impedir la corrida.
 
 ## Estado medido
 
-- `v0.5.1` · 58 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
+- `v0.6.0` · 80 tests · `--self-test` RC 0 · CI en 3.11 / 3.12 / 3.13.
 - **Oraculo diferencial contra el generador de FastAPI** (`fastapi` 0.165.0, `sqlmodel` 0.0.50):
   sobre una app con herencia `SQLModel`, `status.HTTP_201_CREATED`, `Optional[str]` y routers
   con prefijo, el contrato emitido por este radar y el `app.openapi()` real del framework
@@ -269,6 +341,29 @@ $ spec-drift-radar --servidor /tmp/app_flask --openapi /tmp/flask_verdadero.json
 # MARCO DEL SERVIDOR ... rutas_codigo=0 · lector=fastapi
 # HALLAZGOS  rojos=0 · avisos=1   [WARN] SERVIDOR_NO_LEIDO
 # RC 2 · NO_MEDIDO: un cero aquí no es un cero, es una ausencia de lectura
+```
+
+- **Quinto oráculo, el contrato más grande que se publica en JSON: Kubernetes.** Dos releases
+  reales, `v1.28.0` → `v1.29.0` (`api/openapi-spec/swagger.json`, swagger 2.0, 3,0 MB cada una):
+  865 y 878 operaciones, 570 y 577 modelos, **544 modelos comparados**, RC 1 con 35 rupturas.
+  La medición se puede comprobar contra las notas de la release: 25 operaciones desaparecen de
+  `flowcontrol.apiserver.k8s.io/v1beta2` y 25 aparecen en `v1beta3`; `clustercidrs` (9 rutas) sale
+  y `servicecidrs` (12) entra; el campo `uid` desaparece de `networking.v1alpha1.ParentReference`;
+  y los diez campos nuevos son los que la 1.29 estrenó (`PodAffinityTerm.matchLabelKeys` y
+  `mismatchLabelKeys`, `LifecycleHandler.sleep`, `VolumeProjection.clusterTrustBundle`,
+  `PersistentVolumeClaimSpec.volumeAttributesClassName` con su `modifyVolumeStatus`,
+  `LoadBalancerIngress.ipMode`, `ValidationRule.optionalOldSelf`). Antes de este modo el mismo par
+  daba **865 operaciones con 0 campos leídos y ningún aviso**: el lector de OpenAPI 3.x no fallaba
+  con un documento 2.0, devolvía un cero. Ese cero era el defecto; ahora hay dialecto declarado.
+
+```console
+$ for t in v1.28.0 v1.29.0; do curl -sSL -o "k8s_$t.json" \
+    "https://raw.githubusercontent.com/kubernetes/kubernetes/$t/api/openapi-spec/swagger.json"; done
+$ spec-drift-radar --contrato-anterior k8s_v1.28.0.json --openapi k8s_v1.29.0.json
+# MARCO ANTERIOR   dialecto=swagger 2.0 · titulo=Kubernetes · rutas_spec=865 · esquemas=570
+# MARCO NUEVO      dialecto=swagger 2.0 · titulo=Kubernetes · rutas_spec=878 · esquemas=577
+# HALLAZGOS  rojos=35 · avisos=117 · operaciones_comparadas=831 · esquemas_comparados=544
+# RC 1 · ruptura medida: un cliente de la version anterior deja de funcionar
 ```
 
 ## Familia

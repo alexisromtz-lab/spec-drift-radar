@@ -14,14 +14,17 @@ import sys
 from . import __version__
 from .nucleo import (
     comparar,
+    comparar_contratos,
     emitir_openapi,
     leer_json,
     rc_de,
+    rc_de_contratos,
     superficie_openapi,
     superficie_servidor,
 )
 
 CABECERA = "spec-drift-radar · la superficie del servidor contra el contrato que publica"
+CABECERA_CONTRATOS = "spec-drift-radar · la deriva entre dos versiones del contrato"
 
 
 def _archivos_py(directorio: pathlib.Path) -> list:
@@ -62,6 +65,41 @@ def _texto(codigo, spec, hallazgos, rc) -> str:
         lineas.append(f"SIN DERIVA  pares_comparados={len(codigo.operaciones)} · se midieron las dos superficies completas")
     lineas.append("")
     lineas.append(f"RC {rc}" + (" · deriva medida: el contrato y el servidor no dicen lo mismo" if rc == 1 else ""))
+    if rc == 2:
+        lineas.append("RC 2 · NO_MEDIDO: un cero aquí no es un cero, es una ausencia de lectura")
+    return "\n".join(lineas)
+
+
+def _texto_contratos(anterior, nuevo, hallazgos, rc) -> str:
+    operaciones = set((o.metodo, o.ruta) for o in anterior.operaciones) & set((o.metodo, o.ruta) for o in nuevo.operaciones)
+    esquemas = set(n for n, _ in anterior.definiciones) & set(n for n, _ in nuevo.definiciones)
+    lineas = [CABECERA_CONTRATOS, ""]
+    for etiqueta, superficie in (("ANTERIOR", anterior), ("NUEVO   ", nuevo)):
+        lineas.append(f"MARCO {etiqueta}   dialecto={superficie.marco.get('dialecto', 'NO_MEDIDO')}"
+                      f" · titulo={superficie.marco.get('titulo', 'NO_MEDIDO')}"
+                      f" · version={superficie.marco.get('version_declarada', 'NO_MEDIDO')}"
+                      f" · rutas_spec={superficie.marco.get('rutas_spec', 0)}"
+                      f" · esquemas={superficie.marco.get('esquemas', 0)}")
+    huecos = list(anterior.sin_medir) + list(nuevo.sin_medir)
+    if huecos:
+        lineas.append("")
+        lineas.append(f"SIN MEDIR ({len(huecos)})")
+        lineas.extend(f"  - {h}" for h in huecos)
+    if hallazgos:
+        rojos = [h for h in hallazgos if h.severidad == "ROJO"]
+        avisos = [h for h in hallazgos if h.severidad != "ROJO"]
+        lineas.append("")
+        lineas.append(f"HALLAZGOS  rojos={len(rojos)} · avisos={len(avisos)}"
+                      f" · operaciones_comparadas={len(operaciones)} · esquemas_comparados={len(esquemas)}")
+        for h in hallazgos:
+            lineas.append(f"  [{h.severidad:<4}] {h.clase:<22} {h.metodo.upper():<7} {h.ruta:<32} {h.detalle}")
+    elif rc == 0:
+        lineas.append("")
+        lineas.append(f"COMPATIBLE  operaciones_comparadas={len(operaciones)}"
+                      f" · esquemas_comparados={len(esquemas)}"
+                      " · ninguna ruptura medida entre las dos versiones")
+    lineas.append("")
+    lineas.append(f"RC {rc}" + (" · ruptura medida: un cliente de la version anterior deja de funcionar" if rc == 1 else ""))
     if rc == 2:
         lineas.append("RC 2 · NO_MEDIDO: un cero aquí no es un cero, es una ausencia de lectura")
     return "\n".join(lineas)
@@ -134,6 +172,42 @@ def leer(item_id: int):
     return 0
 
 
+def _main_contratos(args, parser) -> int:
+    if args.servidor or args.emitir:
+        parser.error("--contrato-anterior compara dos documentos: no acepta --servidor ni --emitir")
+    if not args.openapi:
+        parser.error("--contrato-anterior necesita --openapi con la version nueva del contrato")
+    documento, error = leer_json(args.contrato_anterior)
+    if error:
+        print(f"RC 2 · NO_MEDIDO: version anterior: {error}")
+        return 2
+    anterior = superficie_openapi(documento)
+    nuevo_documento, error = leer_json(args.openapi)
+    if error:
+        print(f"RC 2 · NO_MEDIDO: version nueva: {error}")
+        return 2
+    nuevo = superficie_openapi(nuevo_documento)
+    hallazgos = comparar_contratos(anterior, nuevo)
+    rc = rc_de_contratos(hallazgos, anterior, nuevo)
+    if args.json:
+        print(json.dumps({
+            "rc": rc,
+            "marco": {"anterior": anterior.marco, "nuevo": nuevo.marco},
+            "sin_medir": list(anterior.sin_medir) + list(nuevo.sin_medir),
+            "operaciones_comparadas": len(set((o.metodo, o.ruta) for o in anterior.operaciones)
+                                         & set((o.metodo, o.ruta) for o in nuevo.operaciones)),
+            "esquemas_comparados": len(set(n for n, _ in anterior.definiciones)
+                                       & set(n for n, _ in nuevo.definiciones)),
+            "hallazgos": [
+                {"clase": h.clase, "severidad": h.severidad, "metodo": h.metodo, "ruta": h.ruta, "detalle": h.detalle}
+                for h in hallazgos
+            ],
+        }, indent=2, ensure_ascii=False))
+    else:
+        print(_texto_contratos(anterior, nuevo, hallazgos, rc))
+    return rc
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="spec-drift-radar",
@@ -144,6 +218,8 @@ def main(argv=None) -> int:
     parser.add_argument("--emitir", help="escribe el contrato derivado del servidor en esta ruta y no compara")
     parser.add_argument("--prefijo", default="",
                         help="prefijo de montaje que el codigo no puede resolver (p. ej. /api/v1); se antepone a todas las rutas")
+    parser.add_argument("--contrato-anterior",
+                        help="version anterior del mismo contrato: compara contrato contra contrato y no usa --servidor")
     parser.add_argument("--json", action="store_true", help="salida JSON con el marco y los hallazgos")
     parser.add_argument("--version", action="version", version=f"spec-drift-radar {__version__}")
     parser.add_argument("--self-test", action="store_true", help="verifica el instrumento consigo mismo")
@@ -151,6 +227,8 @@ def main(argv=None) -> int:
 
     if args.self_test:
         return _self_test()
+    if args.contrato_anterior:
+        return _main_contratos(args, parser)
     if not args.servidor:
         parser.error("falta --servidor (o usa --self-test)")
     directorio = pathlib.Path(args.servidor)
