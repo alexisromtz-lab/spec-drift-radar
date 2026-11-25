@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spec-drift-radar"
+dynamic = ["version"]
+description = "Radar de deriva entre la superficie real de un servidor Python y el contrato OpenAPI que publica"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Platino Labs" }]
+keywords = ["openapi", "drift", "fastapi", "ast", "contract-testing", "static-analysis"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.scripts]
+spec-drift-radar = "spec_drift_radar.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alexisromtz-lab/spec-drift-radar"
+
+[tool.setuptools.dynamic]
+version = { attr = "spec_drift_radar.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["spec_drift_radar*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
